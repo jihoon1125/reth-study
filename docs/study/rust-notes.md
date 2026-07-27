@@ -1,0 +1,182 @@
+# Rust 개념 노트
+
+> reth 읽으면서 만난 문법을 계속 쌓는 파일. 주차별 분석 문서와 분리해서 관리한다.
+
+---
+
+## 제네릭 / 트레이트 바운드
+
+```rust
+struct Foo<T>            // T는 아직 안 정해진 타입 자리
+struct Foo<T: Display>   // T에 조건(트레이트 바운드)
+```
+
+조건이 있어야 `T`로 뭔가 할 수 있다. 조건이 없으면 그 타입에 대해 아무것도 못 한다.
+
+여러 조건은 `+`로 연결: `T: Clone + Debug + Send + Sync + 'static`
+
+`'static`은 라이프타임인데, 지금은 **"빌려온 참조가 없어서 얼마든지 오래 살 수 있는 타입"**
+정도로만 알아두면 됨.
+
+---
+
+## 연관 타입 (associated type) ★
+
+트레이트 안에 선언하는 **"타입 구멍"**. 구현체가 채운다.
+
+```rust
+pub trait NodeTypes {
+    type Primitives: NodePrimitives;   // 구멍 + 그 구멍에 걸린 조건
+}
+```
+
+읽는 법:
+
+```
+type Primitives            → "Primitives라는 타입 구멍이 있다"
+          : NodePrimitives → "단, 그 구멍을 채우는 타입은 NodePrimitives를 구현해야 한다"
+```
+
+일반 제네릭 `<T: Display>`와 **문법 위치만 다르고 의미는 같다.**
+
+비유 — 트레이트가 **양식지**, 연관 타입이 그 **빈칸**:
+
+```
+NodeTypesWithDB 양식지:        이더리움 노드가 제출한 양식:
+  ChainSpec: [    ]      →       ChainSpec: [ ChainSpec     ]
+  Primitives:[    ]      →       Primitives:[ EthPrimitives ]
+  DB:        [    ]      →       DB:        [ DatabaseEnv   ]
+```
+
+### `N::DB`
+
+"N이 자기 `DB` 구멍에 채워 넣은 타입". 덕분에 `ProviderFactory` 코드 한 벌로 이더리움용,
+OP Stack용, 테스트용 노드를 전부 커버한다.
+
+### `<DB as Database>::TX`
+
+"DB를 `Database` 트레이트 **자격으로** 볼 때의 `TX` 타입".
+
+왜 이렇게 장황하냐면, `DB`가 여러 트레이트를 구현하고 그중 둘 이상이 `TX`라는 연관 타입을
+가지면 컴파일러가 어느 쪽인지 모르기 때문. `as`로 모호함을 없앤다.
+
+### equality constraint — `Trait<Assoc = X>`
+
+```rust
+type ChainSpec: EthChainSpec<Header = <Self::Primitives as NodePrimitives>::BlockHeader>;
+```
+
+분해:
+
+```
+type ChainSpec:                          "ChainSpec 구멍이 있고"
+  EthChainSpec<                          "EthChainSpec을 구현해야 하는데"
+    Header = <Self::Primitives as NodePrimitives>::BlockHeader
+  >                                      "단, 그것의 Header 타입이
+                                          Primitives의 BlockHeader와 같아야 한다"
+```
+
+`Header = X`는 **연관 타입을 특정 타입으로 못박는 것**. 하는 말은:
+
+> "체인 스펙이 말하는 헤더 타입과 프리미티브가 말하는 헤더 타입이 서로 달라선 안 된다."
+
+이더리움 헤더용 프리미티브에 OP Stack 체인 스펙을 끼워 넣는 조합을 **컴파일 단계에서 막는다.**
+reth 전체에 이 패턴이 깔려 있음.
+
+---
+
+## 공유와 가변
+
+| 표현 | 의미 |
+|---|---|
+| `Arc<T>` | 여러 스레드가 공유 소유 (C++ `shared_ptr`). 값은 못 바꿈 |
+| `RwLock<T>` | 읽기 여럿 or 쓰기 하나 |
+| `Arc<RwLock<T>>` | 공유 + 가변 |
+
+**읽는 요령: 필드에 락이 붙었나 안 붙었나 = 그 데이터가 런타임에 변하나 안 변하나.**
+
+---
+
+## 타입 별칭 vs newtype
+
+```rust
+type A = B;      // 그냥 줄임말(typedef). 새 타입이 아님
+struct A(B);     // 새 타입(newtype). B와 다른 타입으로 취급됨
+```
+
+newtype에 `Deref`/`DerefMut`를 구현하면 `a.0.foo()` 대신 `a.foo()`로 쓸 수 있다.
+→ 감싸긴 했지만 사용감은 안 감싼 것처럼 만드는 트릭.
+
+---
+
+## `#[auto_impl(&, Arc, Box)]`
+
+매크로. "`T`가 이 트레이트를 구현하면 `&T`, `Arc<T>`, `Box<T>`도 자동으로 구현되게 해줘".
+
+---
+
+## Future / Pin (async — 나중에 다시)
+
+```rust
+fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
+```
+
+- **`self: Pin<&mut Self>`** — `&mut self`와 문법 구조는 같고 self의 **타입만** 명시한 것.
+  "이동하지 않음이 타입으로 보장된 `&mut self`"
+- **`cx: &mut Context<'_>`** — 준비되면 깨워달라고 등록하는 waker를 담은 상자.
+  `'_`는 라이프타임 생략 표시로 특별한 의미 없음
+- **`Poll<T>`** — `enum { Ready(T), Pending }`
+
+전체 의미: "이 퓨처를, 절대 이동시키지 않는다는 전제 하에 한 번 확인해봐. 결과 나왔으면
+`Ready(값)`, 아직이면 `cx`의 waker에 등록해두고 `Pending`."
+
+### 자기참조가 뭔지
+
+"퓨처 객체가 자기 자신을 참조"가 아니라,
+**"퓨처 struct의 한 필드가 같은 struct의 다른 필드 주소를 들고 있는 것"**이 정확한 표현.
+
+```rust
+struct SelfReferential {
+    value: String,                    // 필드 A
+    pointer_to_value: *const String,  // 필드 B — 필드 A를 가리킴
+}
+```
+
+`async fn` 안에서 `let x = ...; let r = &x; something().await; use(r);` 라고 쓰면 컴파일러가
+이걸 struct 하나로 변환하는데, `r` 필드가 `x` 필드의 주소를 담게 된다.
+
+### 왜 이동이 문제인가
+
+러스트의 **이동(move)은 재계산이 아니라 바이트 복사(memcpy)**다. struct 전체가 옮겨지면
+`x`는 새 주소로 잘 가지만, `r`에 저장된 "예전 x의 주소"라는 **숫자값은 그대로 복사만 될 뿐**
+고쳐지지 않는다. → 깨진 참조.
+
+### 함수를 다시 호출하는 건 문제 없음
+
+| 상황 | 주소 재계산? |
+|---|---|
+| 함수를 처음부터 다시 호출 (`example()` 두 번) | **됨** — 매번 새 인스턴스라 자기참조도 새로 만들어짐 |
+| 이미 만들어진(아직 실행 안 끝난) 퓨처를 다른 변수/`Vec`/`Box`로 옮김 | **안 됨** — 이동은 바이트 복사라 내부 포인터가 옛 주소를 그대로 들고 있음 |
+
+**Pin이 하는 일**: 한 번 자리 잡은 퓨처 인스턴스를 그 실행이 끝날 때까지 못 옮기게 막는 것.
+이동을 금지하면 "이동 후 주소 안 맞는" 상황 자체가 발생할 수 없다.
+
+---
+
+## MDBX 계층 구조
+
+```
+MDBX (엔진 = libmdbx. LMDB의 포크. mmap 기반 임베디드 KV 저장소)
+ └─ Environment    ← DB 파일 전체를 대표하는 핸들. ProviderFactory의 `db` 필드
+     └─ Transaction ← 한 번의 읽기/쓰기 세션. DatabaseProvider의 `tx` 필드
+         └─ Cursor  ← 트랜잭션 안에서 테이블을 순회하는 도구
+```
+
+- 관련 크레이트: `crates/storage/libmdbx-rs`(안전한 러스트 래퍼),
+  `mdbx-sys`(원본 C 라이브러리 FFI 바인딩)
+- **MDBX 정책: 읽기 트랜잭션 여러 개 동시 가능 + 쓰기 트랜잭션은 한 번에 하나**
+- 이 정책이 러스트 타입으로 반영된 게 `Database::TX` vs `Database::TXMut`
+
+비유: **MDBX는 건물, Tx는 그 건물에 들어가 볼일 보는 한 번의 방문.**
+`DatabaseProvider`가 건물 전체가 아니라 "지금 이 방문"을 들고 있는 이유는, 트랜잭션이 끝나면
+락도 풀리고 자원도 정리돼야 하기 때문.
