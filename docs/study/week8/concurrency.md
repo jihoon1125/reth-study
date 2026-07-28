@@ -206,6 +206,26 @@ pub fn sync_providers_if_needed(&self) -> ProviderResult<()> {
 - `Relaxed` — 이 변수 자체의 원자성만. torn read는 없다. 주변 순서는 보장 안 함
 - `Acquire`/`Release` — 발행/구독 시점에 주변 메모리 변경도 함께 보이게 보장
 
+### "Relaxed 때문에 틀린 값을 읽어서 조건을 통과해버리는" 케이스는 없나
+
+두 가지가 각각 독립적으로 막는다.
+
+**(a) `Relaxed`는 "아무 값이나" 주지 않는다**
+
+원자 변수에는 **modification order**(그 변수에 일어난 저장들의 순서)가 있고, `Relaxed` 로드는
+**그 순서에 실제로 존재했던 값 중 하나**만 반환한다. 미래 값도 쓰레기 값도 안 나온다
+(out-of-thin-air 금지).
+
+그리고 이 변수에 저장이 일어나는 지점은 **딱 한 곳, sync 완료 직후**다. 따라서:
+
+> 값 `V`를 읽었다 ⟹ 과거에 누군가 `V`를 저장했다 ⟹ **`V`까지의 sync가 실제로 완료된 적이 있다**
+
+`V == current_txnid`로 통과했다면 진짜로 거기까지 동기화가 끝난 것이다. 오래된 값을 읽어도 이
+성질은 깨지지 않는다. 오래된 값은 `current_txnid`보다 **작아서** 조건을 통과 못 하고 한 번 더
+sync 할 뿐이다.
+
+**(b) 효과의 가시성 — 이게 진짜 `Relaxed` 이슈**
+
 `Relaxed`가 위험한 전형적 패턴:
 
 ```
@@ -213,9 +233,26 @@ pub fn sync_providers_if_needed(&self) -> ProviderResult<()> {
 스레드 B:  flag == true 확인 → 데이터를 읽음 → ❌ 아직 옛 데이터일 수 있음
 ```
 
-**여기선 이 패턴이 아니다.** `last_synced_txnid`가 발행하는 "데이터"가 이 프로세스의 공유
-메모리가 아니라 RocksDB 내부 상태와 static file 인덱스이고, 둘 다 자기 동기화를 따로 갖고 있다.
-게다가 위에서 봤듯 최악이 "한 번 더 동기화"라 정확성이 안 깨진다.
+**여기선 이 패턴이 아니다.** sync가 만드는 결과물이 평범한 공유 메모리가 아니기 때문이다.
+
+`providers/static_file/manager.rs:273`
+
+```rust
+pub struct StaticFileProviderInner<N> {
+    map: DashMap<(BlockNumber, StaticFileSegment), LoadedJar>,   // 자체 동기화
+    indexes: RwLock<StaticFileMap<StaticFileSegmentIndex>>,      // 자체 락
+    ...
+}
+```
+
+- `initialize_index()`의 결과 → `DashMap` / `RwLock` 안으로 들어간다
+- `try_catch_up_with_primary()`의 결과 → RocksDB 내부 상태 (RocksDB 자체 동기화)
+
+나중에 이 데이터를 실제로 읽을 때 **저 락들을 반드시 지나가고, happens-before가 거기서 성립한다.**
+
+> **발행(publish) 메커니즘이 `last_synced_txnid`가 아니라 각 자료구조의 내부 락이다.**
+> 원자 변수는 데이터를 넘겨주는 통로가 아니라 "굳이 시도할 필요 있나?"만 답하는 표지판.
+> 표지판이 오래됐으면 헛걸음할 뿐, 표지판을 믿고 데이터를 읽는 구조가 아니다.
 
 > **`Relaxed`가 안전한 건 "틀려도 되는 값"이기 때문.** 정확성은 전부 `sync_lock`과 락 안의
 > 재확인이 책임진다. 락과 원자 변수의 역할을 섞지 않은 게 이 코드의 미덕.
