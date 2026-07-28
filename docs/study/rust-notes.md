@@ -85,6 +85,100 @@ reth 전체에 이 패턴이 깔려 있음.
 
 ---
 
+## 연관 타입 바운드 ≠ 트레이트 상속 ★
+
+혼동하기 쉬운 두 가지.
+
+```rust
+// (a) 트레이트 상속 — 구조가 고정됨
+pub trait NodeTypesWithDB: NodeTypes { ... }
+//                       ^ "NodeTypesWithDB를 구현하려면 NodeTypes도 반드시 구현해야 한다"
+
+// (b) 연관 타입 바운드 — 계약 조항. 조정 가능
+pub trait Database {
+    type TXMut: DbTxMut + DbTx + ...;
+//              ^^^^^^^^^^^^^^ "TXMut 자리에 넣을 타입은 이것들을 구현해야 한다"
+}
+```
+
+`DbTxMut` 자체는 `DbTx`를 상속하지 **않는다**. 두 트레이트는 독립적이다.
+그런데 `Database::TXMut`의 바운드가 둘 다 요구하므로, 실제 RW 트랜잭션 타입은 양쪽을 만족한다.
+
+→ 그래서 `impl<TX: DbTx> ... for DatabaseProvider<TX, N>` (읽기 구현)이 RW provider에도 걸린다.
+
+상속이면 구조가 못박히지만, 바운드는 계약이라 조정 가능하고 각 트레이트를 독립적으로 쓸 수 있다.
+
+---
+
+## turbofish `::<T>`
+
+함수에 **값이 아니라 타입**을 넘기는 문법.
+
+```rust
+tx.get_by_encoded_key::<tables::PlainAccountState>(address)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ turbofish
+```
+
+### 타입을 "설명서"로 쓰는 패턴 (reth의 테이블)
+
+```rust
+pub trait Table {
+    const NAME: &'static str;
+    type Key: Key;
+    type Value: Value;
+}
+
+fn get<T: Table>(&self, key: T::Key) -> Result<Option<T::Value>, DatabaseError>;
+//                           ^^^^^^                      ^^^^^^^^ T에 따라 자동 결정
+```
+
+테이블이 값이 아니라 **타입**이라, 함수 하나로 모든 테이블을 다루면서도 키/값 타입 불일치가
+컴파일 에러가 된다.
+
+```rust
+tx.get::<PlainAccountState>(addr)       // Key=Address, Value=Account
+tx.get::<Bytecodes>(hash)               // Key=B256,    Value=Bytecode
+tx.get::<PlainAccountState>(some_b256)  // ❌ 컴파일 에러
+```
+
+---
+
+## `?` vs `map_err` ★
+
+```rust
+tx.get(dbi, key)                               // Result<Option<Bytes>, mdbx::Error>
+  .map_err(|e| DatabaseError::Read(e.into()))  // Result<Option<Bytes>, DatabaseError>
+  ?                                            // Option<Bytes>
+```
+
+- **`map_err`** — 에러 타입만 갈아끼운다. **벗기지 않는다**
+- **`?`** — 벗긴다. `Ok`면 내용물을 꺼내고, `Err`면 함수를 즉시 종료
+- `?`는 함수 반환 타입의 에러로 **변환 가능할 때만** 통과시키므로,
+  타입이 안 맞으면 `map_err`로 먼저 맞춰줘야 한다
+  → **`map_err`는 `?`를 쓰기 위한 준비 작업**
+
+## `.transpose()`
+
+`Option<Result<T, E>>` ↔ `Result<Option<T>, E>` 뒤집기.
+
+```rust
+opt_bytes.map(decode)   // Option<Result<Account, E>>  "있으면 디코딩했는데 실패했을 수도"
+         .transpose()   // Result<Option<Account>, E>  "실패면 에러, 성공이면 Option"
+```
+
+## 클로저 `|x| { ... }`
+
+익명 함수.
+
+```rust
+self.execute_with_operation_metric(op, None, |tx| { tx.get(...) })
+//                                            ^^^^^^^^^^^^^^^^^^^ 넘겨진 일감
+```
+
+"하고 싶은 일을 함수로 넘겨줘, 내가 감싸서(시간 재고/락 잡고) 실행해줄게" 구조.
+
+---
+
 ## 공유와 가변
 
 | 표현 | 의미 |
