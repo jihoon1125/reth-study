@@ -191,6 +191,82 @@ self.execute_with_operation_metric(op, None, |tx| { tx.get(...) })
 
 ---
 
+## 트레이트 객체 `dyn Trait`
+
+```rust
+reader_txn_tracker: Option<Arc<dyn ReaderTxnTracker>>
+```
+
+- **제네릭 `impl<TX: DbTx>`** — 컴파일 타임에 타입 확정, 타입마다 코드 생성(정적 디스패치)
+- **`dyn Trait`** — 런타임에 함수 포인터를 따라감(동적 디스패치)
+
+`dyn`을 쓰는 전형적 이유: 그 타입을 제네릭 파라미터로 들고 있지 않아서 타입으로 표현할 수 없을 때.
+(`DatabaseProvider<TX, N>`에는 `DB` 파라미터가 없다)
+
+## blanket impl
+
+```rust
+impl<DB: Database> ReaderTxnTracker for DB { ... }
+```
+
+특정 타입 하나가 아니라 **"`Database`를 구현한 모든 타입"** 에 한꺼번에 구현. 담요를 덮듯이.
+
+> **바운드는 능력을 요구하고, blanket impl은 능력을 공급한다.** 짝을 이루는 기법.
+
+## let-else
+
+```rust
+let Some(sync_state) = &self.read_only_sync else { return Ok(()) };
+```
+
+`Some`이면 꺼내서 바인딩, 아니면 `else` 실행. `else` 블록은 **반드시 함수를 벗어나야** 한다
+(return/break/panic). 중첩 없이 조기 반환하는 관용구.
+
+## Mutex — 데이터 보호 vs 작업 직렬화
+
+```rust
+sync_lock: Mutex<()>    // 안이 비어 있다
+```
+
+`Mutex<T>`가 항상 데이터를 보호하는 건 아니다. `Mutex<()>`는 **"이 구간을 한 번에 한 스레드만"**
+(상호배제) 만 강제하는 용도.
+
+### 오염(poisoning)
+
+```rust
+lock().unwrap_or_else(|e| e.into_inner())
+```
+
+러스트 `Mutex`는 락을 쥔 스레드가 패닉하면 **오염** 상태가 되고, 이후 `lock()`이 `Err`를 반환한다.
+`into_inner()` = "오염 무시하고 데이터 줘". 보호할 데이터가 없는 `Mutex<()>`라면 적절한 처리.
+
+## 원자 변수와 `Ordering`
+
+`Ordering`은 **"이 원자 연산 주변의 다른 메모리 연산까지 순서를 보장할 것인가"** 를 정한다.
+
+| | 보장 |
+|---|---|
+| `Relaxed` | 이 변수 자체의 원자성만. torn read 없음. 주변 순서 보장 X |
+| `Acquire`/`Release` | 발행/구독 시점에 **주변 메모리 변경도 함께** 보이게 |
+
+`Relaxed`가 위험한 전형적 패턴:
+
+```
+A:  데이터를 씀 → flag = true (Relaxed)
+B:  flag == true 확인 → 데이터 읽음 → ❌ 아직 옛 데이터일 수 있음
+```
+
+**`Relaxed`가 안전하려면 그 값이 "틀려도 되는 값"이어야 한다.** 정확성은 락이 책임지고,
+원자 변수는 성능 필터 역할만 하는 구조라면 `Relaxed`로 충분하다.
+(예: reth의 `sync_providers_if_needed` — double-checked locking)
+
+## `extern "C" fn`
+
+C 라이브러리가 러스트 함수를 **거꾸로 호출**하는 콜백. 예: libmdbx가 "느린 리더 발견했는데
+어떻게 할까?"를 러스트에 묻는 `handle_slow_readers`.
+
+---
+
 ## 타입 별칭 vs newtype
 
 ```rust
