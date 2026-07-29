@@ -273,6 +273,74 @@ B:  flag == true 확인 → 데이터 읽음 → ❌ 아직 옛 데이터일 수
 성립하지 않는다. 따라서 원자 변수를 **데이터 발행 플래그로 쓰면 위험**하고,
 발행은 다른 락/자료구조가 담당하고 원자 변수는 **힌트로만** 쓰면 안전하다.
 
+## `unsafe impl Send` / `unsafe impl Sync`
+
+"컴파일러야, 안전성은 내가 책임질 테니 통과시켜"라는 선언. 반드시 SAFETY 주석으로 근거를 남긴다.
+
+```rust
+// SAFETY: Access to the transaction is synchronized by the lock.
+unsafe impl Send for TransactionPtr {}
+unsafe impl Sync for TransactionPtr {}
+```
+
+**락이 있으니 `Sync`가 불필요한 게 아니라, 락이 있으니 `Sync`가 안전(sound)한 것이다.**
+방향을 헷갈리기 쉬움.
+
+## ★ 제네릭 컨텍스트에서는 선언된 바운드만이 진실이다
+
+```rust
+impl<TX: DbTx + DbTxMut + 'static, N: ...> DatabaseProvider<TX, N> {
+//      ^^^^^^^^^^^^^^^^^^^^^^^^^ Sync 없음
+```
+
+실제로 들어올 구체 타입(`Transaction<RW>`)이 `Sync`여도, **바운드에 안 적었으면 컴파일러에게는
+없는 성질**이다. 그래서 이 impl 안에서는 `&self`를 rayon `spawn`에 넘길 수 없다.
+
+추론 사슬:
+
+```
+TX가 Sync를 모름
+  → DatabaseProvider<TX,N>의 auto Sync 불성립 (필드 tx: TX 때문)
+  → &DatabaseProvider<TX,N> 은 Send 아님   (&T: Send ⟺ T: Sync)
+  → s.spawn(f)의 f: Send 불만족
+  → 컴파일 에러
+```
+
+### `&T: Send ⟺ T: Sync`
+
+외워둘 것. "참조를 다른 스레드로 보낼 수 있다" = "여러 스레드가 동시에 참조해도 된다".
+
+### disjoint closure capture (Rust 2021)
+
+클로저는 `self` 통째가 아니라 **실제로 쓰는 필드만** 캡처한다. 그래서 이런 우회가 가능하다:
+
+```rust
+// avoid capturing &self.tx in scope below.
+let sf_provider = &self.static_file_provider;   // Sync인 필드만 미리 빼둔다
+s.spawn(|_| { sf_provider.write(...) });        // tx는 캡처되지 않음
+```
+
+## `scope` — 클로저가 바깥 변수를 수정할 수 있는 이유
+
+```rust
+let mut sf_result = None;
+pool.in_place_scope(|s| {
+    s.spawn(|_| { sf_result = Some(...); });   // 바깥 변수를 가변 대여
+});
+// 여기서 sf_result를 읽음
+```
+
+`scope`는 **"스코프가 끝날 때까지 모든 스폰 작업이 끝난다"** 를 타입으로 보장하므로 컴파일러가
+대여를 허용한다. `std::thread::spawn`은 언제 끝날지 모르니 이게 안 된다.
+
+- `scope` vs `in_place_scope` — 후자는 **호출 스레드도 일꾼으로 쓴다**
+- 스코프 클로저가 `Result`를 반환하게 만들면 그 안에서 `?`를 그대로 쓸 수 있다
+  (`Ok::<_, ProviderError>(())` + `})?`)
+
+## `#[derive(EnumIs)]`
+
+`is_database()`, `is_static_file()` 같은 variant 판별 함수를 자동 생성.
+
 ## `extern "C" fn`
 
 C 라이브러리가 러스트 함수를 **거꾸로 호출**하는 콜백. 예: libmdbx가 "느린 리더 발견했는데
