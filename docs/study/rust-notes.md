@@ -110,6 +110,97 @@ pub trait Database {
 
 ---
 
+## ★ GAT (Generic Associated Type)
+
+**자기 제네릭 파라미터를 가진 연관 타입.** 빈칸이 함수처럼 인자를 받는다.
+
+```rust
+type TX;                 // 빈칸 하나
+type Cursor<T: Table>;   // "테이블 T를 주면 그에 맞는 커서 타입을 내놓는 빈칸"
+```
+
+```rust
+// db-api/src/transaction.rs:23
+pub trait DbTx: Debug + Send {
+    type Cursor<T: Table>: DbCursorRO<T> + Send;
+    fn cursor_read<T: Table>(&self) -> Result<Self::Cursor<T>, DatabaseError>;
+}
+
+// db/src/implementation/mdbx/tx.rs:286
+impl<K: TransactionKind> DbTx for Tx<K> {
+    type Cursor<T: Table> = Cursor<K, T>;    // 한 줄로 테이블 29개 전부
+}
+```
+
+Rust 1.65(2022-11) 안정화. `docs/design/database.md:5`가 *"using Rust **Stable** GATs"* 라고
+언어 기능 이름을 명시한 이유 — **그 전에는 이 아키텍처가 표현 불가능했다.**
+
+### 없으면 어떻게 되나 — 대안 3개 전부 못 씀
+
+| | 타입 안전성 | 성능 | 실사용 |
+|---|---|---|---|
+| `Box<dyn DbCursorRO<T>>` | 유지 | ❌ `walk`류 상실 + vtable + 힙 | 불가 |
+| 트레이트에 파라미터 (`DbTxCursor<T>`) | 유지 | ✅ 동일 | **바운드 지옥** |
+| 커서 타입 소거 (바이트) | ❌ 상실 | 보통 | 설계 후퇴 |
+
+### ★ `for<...>` HRTB는 라이프타임 전용이다
+
+트레이트에 파라미터를 올리는 우회로가 죽는 지점.
+
+```rust
+impl<TX: DbTxCursor<tables::A> + DbTxCursor<tables::B> + ...> ...   // 만지는 테이블 전부 나열
+impl<TX: for<'a> Foo<'a>> ...                                       // ✅ 라이프타임은 됨
+impl<TX: for<T: Table> DbTxCursor<T>> ...                           // ❌ 문법 자체가 없음
+```
+
+> **GAT가 메운 구멍이 정확히 이것** — "모든 T에 대해 그 타입이 존재한다"를 트레이트 하나에 담는 것.
+
+---
+
+## ★ 메서드는 struct가 아니라 (타입, 트레이트) 쌍에 속한다
+
+흔한 오해: "impl을 여러 개 하면 struct 아래에 메서드가 쫘라락 평평하게 붙는다."
+
+```
+❌ 잘못된 그림                        ✅ 실제
+struct Tx<RW>                        Tx<RW>
+  ├─ cursor_read()  ← 트레이트 A        ├─ [트레이트 A] 서랍 ─ cursor_read()
+  ├─ cursor_read()  ← 트레이트 B        ├─ [트레이트 B] 서랍 ─ cursor_read()
+  └─ ...  이름 충돌!                    └─ [DbTx]     서랍 ─ get(), commit()
+```
+
+**서랍이 다르니 이름이 겹쳐도 된다.** 이미 쓰고 있는 증거:
+
+```rust
+u64::from(1u8)      // <u64 as From<u8>>::from
+u64::from(1u16)     // <u64 as From<u16>>::from   ← u64에 from이 십수 개 있다
+```
+
+`tx.method()` / `Type::method()`는 **후보가 하나일 때만 작동하는 문법 설탕**이다.
+애매하면 UFCS로 서랍을 지정한다: `<Type as Trait<X>>::method(&v)`
+
+### 추론이 되는 조건 — 파라미터가 시그니처에 나타나는가
+
+```rust
+trait From<T>       { fn from(value: T) -> Self; }
+//         ^                        ^ T가 인자에 있음 → 추론 가능
+
+trait DbTxCursor<T> { fn cursor_read(&self) -> Result<Self::Cursor, E>; }
+//               ^                   ^^^^^ T가 어디에도 없음 → 추론 불가
+```
+
+같은 문제를 겪는 표준 예가 `Into`:
+
+```rust
+let x: u64 = 1u8.into();   // ✅ 좌변이 단서
+let x = 1u8.into();        // ❌ type annotations needed
+```
+
+**GAT는 파라미터를 트레이트가 아니라 연관 타입·메서드 쪽에 두어 서랍을 하나로 유지한다.**
+그래서 `tx.cursor_read::<HashedAccounts>()` 한 줄로 끝난다.
+
+---
+
 ## turbofish `::<T>`
 
 함수에 **값이 아니라 타입**을 넘기는 문법.
@@ -203,6 +294,24 @@ reader_txn_tracker: Option<Arc<dyn ReaderTxnTracker>>
 `dyn`을 쓰는 전형적 이유: 그 타입을 제네릭 파라미터로 들고 있지 않아서 타입으로 표현할 수 없을 때.
 (`DatabaseProvider<TX, N>`에는 `DB` 파라미터가 없다)
 
+### 오브젝트 안전성과 `where Self: Sized`
+
+모든 트레이트를 `dyn`으로 만들 수 있는 건 아니다. 제네릭 메서드나 `impl Trait` 인자가 있으면
+vtable을 만들 수 없다. 그런 메서드에 `where Self: Sized`를 붙이면 **트레이트는 오브젝트 안전해지지만
+그 메서드는 `dyn`에서 호출할 수 없다.**
+
+```rust
+// db-api/src/cursor.rs:39-49
+fn walk(&mut self, start_key: Option<T::Key>) -> Result<Walker<'_, T, Self>, DatabaseError>
+where Self: Sized;                                    // ← dyn에서 호출 불가
+
+fn walk_range(&mut self, range: impl RangeBounds<T::Key>) -> ...
+where Self: Sized;                                    // impl Trait 인자 = 제네릭 메서드
+```
+
+→ `Box<dyn DbCursorRO<T>>`는 **컴파일은 되지만 `walk`/`walk_range`/`walk_back`을 잃는다.**
+GAT 없이 커서를 트레이트 오브젝트로 만들 수 없는 이유 중 하나.
+
 ## blanket impl
 
 ```rust
@@ -286,6 +395,31 @@ unsafe impl Sync for TransactionPtr {}
 **락이 있으니 `Sync`가 불필요한 게 아니라, 락이 있으니 `Sync`가 안전(sound)한 것이다.**
 방향을 헷갈리기 쉬움.
 
+### 표준 규칙 — `Mutex<T>`는 `T`가 `Sync`가 아니어도 `Sync`다
+
+```rust
+impl<T: ?Sized + Send> Sync for Mutex<T> {}     // T: Sync 요구 안 함
+```
+
+**"내부를 mutate하니까 `Sync`가 될 수 없다"는 정확히 거꾸로다.**
+내부를 mutate하니까 → 락으로 감싸고 → **그 결과 `Sync`가 된다.** `Mutex`가 존재하는 이유가 이것.
+
+MDBX 날 핸들(`*mut MDBX_txn`)은 스레드 안전하지 않다. 그래서 러스트 래퍼가 뮤텍스를 씌웠고,
+씌운 결과 `Transaction<RO>`/`Transaction<RW>` 둘 다 `Send + Sync`다
+(`libmdbx-rs/transaction.rs:724-730`의 `assert_send_sync` 컴파일 타임 단언).
+
+### 바운드는 없앨 수 있지만 요구는 이동할 뿐이다
+
+`DbTx`/`DbTxMut`에 `Sync`가 없는 건 위험해서가 아니라 **`chore(db): Remove Sync from DbTx`
+(#20516, 2025-12-22)** 에서 뺐기 때문이다. 45개 파일을 건드린 바운드 최소화 리팩터링이었고
+그 대가로 `#[auto_impl(&, Arc, Box)]`가 `(&, Box)`로 좁아졌다
+(`Arc<T>: Sync`는 `T: Send + Sync`를 요구하므로).
+
+그런데 `Database::TX`/`TXMut`에는 `Send + Sync`가 **그대로 남아 있다**(`db-api/database.rs:13-15`).
+
+> **트레이트에서 요구를 빼도 사라지는 게 아니라, 진짜 필요한 곳으로 옮겨갈 뿐이다.**
+> 트레이트는 자기 메서드가 요구하지 않는 바운드를 넣지 않는 게 원칙 (구현자 폭을 넓힌다).
+
 ## ★ 제네릭 컨텍스트에서는 선언된 바운드만이 진실이다
 
 ```rust
@@ -333,9 +467,35 @@ pool.in_place_scope(|s| {
 `scope`는 **"스코프가 끝날 때까지 모든 스폰 작업이 끝난다"** 를 타입으로 보장하므로 컴파일러가
 대여를 허용한다. `std::thread::spawn`은 언제 끝날지 모르니 이게 안 된다.
 
-- `scope` vs `in_place_scope` — 후자는 **호출 스레드도 일꾼으로 쓴다**
 - 스코프 클로저가 `Result`를 반환하게 만들면 그 안에서 `?`를 그대로 쓸 수 있다
   (`Ok::<_, ProviderError>(())` + `})?`)
+
+### ★ `scope` vs `in_place_scope` — 차이는 `Send` 바운드다
+
+```rust
+// rayon-core/src/thread_pool/mod.rs:283-316
+pub fn scope<'scope, OP, R>(&self, op: OP) -> R
+where OP: FnOnce(&Scope<'scope>) -> R + Send,   // ← Send 필요
+      R: Send,
+{ self.install(|| scope(op)) }                   // 클로저 본문을 풀 스레드로 옮겨 실행
+
+pub fn in_place_scope<'scope, OP, R>(&self, op: OP) -> R
+where OP: FnOnce(&Scope<'scope>) -> R,           // ← Send 불필요
+{ do_in_place_scope(Some(&self.registry), op) }  // 클로저 본문을 현재 스레드에서 실행
+```
+
+| | 클로저 본문이 실행되는 곳 | `OP: Send` |
+|---|---|---|
+| `ThreadPool::scope` | 풀 안으로 **진입해서** | 필요 |
+| `ThreadPool::in_place_scope` | **현재 스레드**에서 그대로 | 불필요 |
+
+~~"호출 스레드도 일꾼으로 쓴다"~~ 는 부정확하다. 정확히는 **"클로저 본문을 현재 스레드에서
+실행하고 풀에 합류하지 않는다"**. (스폰 작업을 전부 기다린 뒤 반환하는 건 **둘 다 같다** —
+차이점이 아님)
+
+**왜 이게 중요하냐**: `save_blocks`가 `scope`를 썼다면 바깥 클로저가 `Send`여야 하고
+→ `&self`가 `Send`여야 하고 → `TX: Sync`가 필요한데 바운드에 없다 → **컴파일 에러**.
+`in_place_scope`는 `Send`를 요구하지 않아 이 문제가 아예 생기지 않는다.
 
 ## `#[derive(EnumIs)]`
 
@@ -357,6 +517,67 @@ struct A(B);     // 새 타입(newtype). B와 다른 타입으로 취급됨
 
 newtype에 `Deref`/`DerefMut`를 구현하면 `a.0.foo()` 대신 `a.foo()`로 쓸 수 있다.
 → 감싸긴 했지만 사용감은 안 감싼 것처럼 만드는 트릭.
+
+### 실례 — `Address`(newtype 2겹) vs `B256`(별칭 1겹)
+
+```rust
+// alloy-primitives/src/bits/macros.rs:74 — wrap_fixed_bytes! 매크로가 생성
+#[repr(transparent)]
+pub struct Address(pub FixedBytes<20>);        // newtype
+
+// alloy-primitives/src/bits/fixed.rs:36
+pub struct FixedBytes<const N: usize>(pub [u8; N]);
+
+// alloy-primitives/src/aliases.rs:65-86
+pub type B256 = FixedBytes<32>;                // 별칭! 새 타입 아님
+```
+
+```
+Address ──.0──▶ FixedBytes<20> ──.0──▶ [u8; 20]      → self.0 .0
+B256 (== FixedBytes<32>)        ──.0──▶ [u8; 32]      → self.0
+```
+
+`Encode` 구현이 `self.0 .0` / `self.0`로 미묘하게 다른 이유가 **겹수 차이**다.
+
+### `#[repr(transparent)]`
+
+"메모리 레이아웃이 안쪽 필드와 **100% 동일**하다"는 선언. 그래서 `Address`와 `[u8; 20]`은
+메모리에서 구분 불가능한 20바이트다.
+
+```rust
+impl Encode for Address {
+    type Encoded = [u8; 20];
+    fn encode(self) -> Self::Encoded { self.0 .0 }    // 껍데기만 벗김. 바이트 이동 0
+}
+```
+
+`db-api/transaction.rs:29-31`의 주석 *"raw keys **that encode to themselves** like Address and B256"*
+이 이 얘기다. 컴파일 후 명령어가 0개다.
+
+대조군 (`db-api/models/accounts.rs:122-131`) — 얘는 진짜 인코딩:
+
+```rust
+fn encode(self) -> [u8; 52] {
+    let mut buf = [0u8; 52];              // 새 버퍼 할당
+    buf[..20].copy_from_slice(...);       // 진짜 memcpy
+    buf[20..].copy_from_slice(...);
+    buf
+}
+```
+
+### deref coercion — `&Address`를 `&[u8; 20]` 자리에 넘기기
+
+```rust
+// provider.rs:1468 — 인자 타입은 &<T::Key as Encode>::Encoded = &[u8; 20]
+self.tx.get_by_encoded_key::<tables::PlainAccountState>(address)   // address: &Address
+```
+
+캐스팅이 아니라 **컴파일러의 자동 역참조**다. `Address`와 `FixedBytes`가 둘 다 `Deref`를
+파생해서 `&Address` → `&FixedBytes<20>` → `&[u8; 20]`로 **두 단계** 강제 변환된다.
+
+> `get`(소유권 `T::Key`)과 `get_by_encoded_key`(참조 `&Encoded`) 두 개가 있는 이유:
+> `encode(self)`가 소유권을 먹으므로 `&Address`만 있으면 복사가 필요한데,
+> 후자는 참조를 그대로 넘겨 복사 0. 계정 조회는 블록마다 수만 번 일어난다.
 
 ---
 
@@ -431,3 +652,98 @@ MDBX (엔진 = libmdbx. LMDB의 포크. mmap 기반 임베디드 KV 저장소)
 비유: **MDBX는 건물, Tx는 그 건물에 들어가 볼일 보는 한 번의 방문.**
 `DatabaseProvider`가 건물 전체가 아니라 "지금 이 방문"을 들고 있는 이유는, 트랜잭션이 끝나면
 락도 풀리고 자원도 정리돼야 하기 때문.
+
+### 타입 치환 사슬 — `self.tx`가 결국 뭔가
+
+```
+self.tx : TX                                   provider.rs:189      [제네릭 이름]
+   = Tx<RW>                                    mdbx/mod.rs:263      DatabaseEnv::TXMut
+        └ inner: Transaction<RW>               libmdbx-rs:61
+             └ Arc<TransactionInner<RW>>
+                  └ txn: TransactionPtr        libmdbx-rs:542
+                       ├ *mut ffi::MDBX_txn    ← 진짜 핸들
+                       └ lock: Arc<Mutex<()>>  ← 트랜잭션당 1개
+```
+
+`TX`(제네릭 이름)와 `Tx<RW>`(구체 타입)는 **다른 게 아니라 같은 값**이다.
+
+### 이름: `tx` vs `txn` vs `txnid`
+
+| 표기 | 뜻 | 쓰이는 곳 |
+|---|---|---|
+| `txn` | DB 트랜잭션 — **C API 어휘** (`MDBX_txn`, `mdbx_txn_begin`) | `libmdbx-rs` 안쪽, FFI 근처 |
+| `tx` (DB 문맥) | DB 트랜잭션 — reth 상위 어휘 | `DbTx`, `self.tx`, `tx.get()` |
+| `tx` (이더리움 문맥) | **이더리움 트랜잭션** | `TxNumber`, `TxHash`, `tx_nums` |
+| `txnid` | 트랜잭션 **ID(u64)** — MVCC 스냅샷 버전 | `oldest_reader_txnid`, `last_txnid` |
+
+**판별 요령**: 뒤에 뭐가 붙으면(`tx_num`, `TxHash`) 이더리움 트랜잭션, 혼자 서서 메서드를
+부르면(`self.tx`, `tx.get()`) DB 트랜잭션. `save_blocks` 첫 줄에 둘이 동시에 나온다:
+
+```rust
+let first_tx_num = self.tx.cursor_read::<tables::TransactionBlocks>()?  // provider.rs:597
+//      ^^^^^^^^        ^^ DB 트랜잭션
+//      └ 이더리움 트랜잭션 번호
+```
+
+**이름이 `tx` → `txn`으로 바뀌는 지점이 러스트/C 경계다.**
+
+### ★ 스레드 종속성 — reth는 명시적으로 끈다
+
+```rust
+// libmdbx-rs/src/flags.rs:202 — 조건 없이 항상
+flags |= ffi::MDBX_NOSTICKYTHREADS;
+```
+
+MDBX C 소스(`mdbx.c:2615-2623`)가 설명한다:
+
+> The slot's address is saved in **thread-specific data** so that subsequent read transactions
+> started by the same thread need no further locking. **If `MDBX_NOSTICKYTHREADS` is set, the
+> slot address is not saved in thread-specific data.**
+
+**`NOSTICKYTHREADS` = "트랜잭션을 스레드에 묶지 마라".** 그래서 `Tx<RO>`/`Tx<RW>` 둘 다
+`Send + Sync`다. 대가로 매 begin마다 `lck_rdt_lock` 경합이 생기는데, 그걸 완화하려고
+`ReadTxnPool`(리셋된 핸들 256개 재사용 큐, `txn_pool.rs`)이 있다.
+
+### 뮤텍스는 트랜잭션당 하나 — RO 동시성의 조건
+
+```rust
+impl TransactionPtr {
+    fn new(txn: *mut ffi::MDBX_txn) -> Self {
+        Self { txn, lock: Arc::new(Mutex::new(())) }   // 트랜잭션 만들 때마다 새 뮤텍스
+    }
+}
+```
+
+| | 결과 |
+|---|---|
+| RO 트랜잭션을 **여러 개** 열기 | ✅ 완전 병렬. 각자 다른 뮤텍스. 제한은 reader slot(기본 126) |
+| **하나의** 트랜잭션을 여러 스레드에서 | ❌ 직렬화. `get`/`put`/커서 전부 같은 락을 지나감 |
+
+reth는 당연히 전자다 — RPC 요청마다 자기 `Tx<RO>`를 연다. `ReadTxnPool`의 존재
+(*"Under high concurrency (e.g., prewarming), this becomes a contention point"*)가 그 증거.
+
+`begin_ro_txn`(대기·재시도 없음)과 `begin_rw_txn`(*"will block while there are any other
+read-write transactions open"*, `Error::Busy`면 250ms 자며 재시도)의 대비가 정책을 그대로 보여준다.
+
+### 경합을 문제로 취급한다는 증거
+
+```rust
+// libmdbx-rs/transaction.rs:579-592
+fn lock(&self) -> MutexGuard<'_, ()> {
+    if let Some(lock) = self.lock.try_lock() { lock }
+    else {
+        tracing::trace!(target: "libmdbx",
+            backtrace = %std::backtrace::Backtrace::capture(),   // ← 백트레이스를 뜬다
+            "Transaction lock is already acquired, blocking...");
+        self.lock.lock()
+    }
+}
+```
+
+같은 트랜잭션을 여러 스레드가 건드리는 건 **설계상 일어나선 안 되는 일**로 취급한다.
+
+### `TxnManager` — 전용 스레드 하나
+
+`begin_rw_txn`은 FFI를 직접 부르지 않고 `mdbx-rs-txn-mgr` 스레드에 메시지를 보내 대기한다
+(`txn_manager.rs:66-114`). 반면 `begin_ro_txn`은 **호출 스레드에서 직접** `mdbx_txn_begin_ex`를
+부른다(`transaction.rs:72-83`). writer 락 획득을 한 곳에 모으려는 구조로 보인다.

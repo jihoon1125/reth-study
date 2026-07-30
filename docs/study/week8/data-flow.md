@@ -53,10 +53,26 @@ runtime.storage_pool().in_place_scope(|s| {
 })?;
 ```
 
-### `in_place_scope`
+### `in_place_scope` — 성능이 아니라 컴파일 가능 여부의 문제
 
-일반 `scope`와 달리 **호출 스레드도 일꾼으로 쓴다.** 그리고 `spawn`한 작업이 전부 끝나야
-반환된다(암묵적 배리어).
+rayon-core 1.13 시그니처를 비교하면 차이가 명확하다.
+
+```rust
+pub fn scope<'scope, OP, R>(op: OP) -> R
+where OP: FnOnce(&Scope<'scope>) -> R + Send,    // ← 클로저가 Send여야 함
+      R: Send,
+
+pub fn in_place_scope<'scope, OP, R>(op: OP) -> R
+where OP: FnOnce(&Scope<'scope>) -> R,           // ← Send 요구 없음
+```
+
+`in_place_scope`는 **클로저 본문을 호출 스레드에서 실행하므로** `Send`를 요구하지 않는다.
+
+여기서는 클로저가 `&self`를 캡처하는데, 아래 §"MDBX만 `spawn`이 없는 이유"에서 보듯
+`&DatabaseProvider<TX,N>`은 `Send`가 아니다. 즉 **`scope`를 썼다면 애초에 컴파일이 안 된다.**
+"호출 스레드를 놀리지 않는다"는 부수 효과이지 선택 이유가 아니다.
+
+`spawn`한 작업이 전부 끝나야 반환되는 것(암묵적 배리어)은 양쪽 공통이다.
 
 ### MDBX만 `spawn`이 없는 이유 — 컴파일이 안 된다
 
@@ -170,23 +186,44 @@ pub fn senders<P>(provider: &P) -> Self {
 }
 ```
 
-**전부 `storage_v2` 하나로 갈린다.** 화요일에 본 `use_hashed_state()`도 같은 플래그였다
+**대부분 `storage_v2` 하나로 갈린다.** 화요일에 본 `use_hashed_state()`도 같은 플래그였다
 (`db-api/models/metadata.rs:85`). 즉 `storage_v2`는 **저장 레이아웃 세대를 통째로 결정하는
 스위치**다.
+
+단, **receipts는 예외로 2차원이다** — `storage_v2` × 프루닝 설정 (`either_writer.rs:187`):
+
+```rust
+if !receipts_in_static_files && prune_modes.has_receipts_pruning() ||
+    receipts_in_static_files && !prune_modes.receipts_log_filter.is_empty()
+{
+    EitherWriterDestination::Database      // ← 지워야 하니까 MDBX로
+} else {
+    EitherWriterDestination::StaticFile
+}
+```
+
+static file은 append-only라 **중간을 못 지운다.** 그래서 성격상 static file에 딱 맞는
+receipts도 프루닝을 켜면 MDBX로 보낸다.
 
 ### 목적지 표
 
 | 데이터 | v1 (`storage_v2 = false`) | v2 (`storage_v2 = true`) | 근거 |
 |---|---|---|---|
-| 헤더 / 바디 / 트랜잭션 | **StaticFile** | **StaticFile** | 항상. `insert_block_mdbx_only` 주석 |
+| 헤더 본문 / 트랜잭션 본문 | **StaticFile** | **StaticFile** | 항상 |
+| `HeaderNumbers` (해시→번호) | Database | Database | `provider.rs:808` |
+| `BlockBodyIndices`, `TransactionBlocks`, ommers, withdrawals | Database | Database | `insert_block_mdbx_only` |
 | senders | Database | **StaticFile** | `either_writer.rs:981` |
-| receipts | Database | **StaticFile** | `either_writer.rs:182` |
+| receipts | Database | **StaticFile** (프루닝 켜면 Database) | `either_writer.rs:182` |
 | account changesets | Database | **StaticFile** | `either_writer.rs:994` |
 | storage changesets | Database | **StaticFile** | `either_writer.rs:1007` |
 | `TransactionHashNumbers` | Database | **RocksDB** | `either_writer.rs:241` |
 | `AccountsHistory` | Database | **RocksDB** | `either_writer.rs:259` |
 | `StoragesHistory` | Database | **RocksDB** | `either_writer.rs:225` |
 | 현재 계정 상태 | Database (`PlainAccountState`) | Database (`HashedAccounts`) | 화요일 §5 |
+
+> ⚠️ **"블록"을 한 덩어리로 묶으면 안 된다.** 헤더·트랜잭션 **본문**은 static file로 가지만,
+> 그것을 찾아가는 **인덱스**(`HeaderNumbers`, `BlockBodyIndices`, `TransactionBlocks`)는
+> MDBX에 남는다. 목요일 §5의 "MDBX가 위치 정보를 든다"가 이 행들이다.
 
 **v2로 가면 MDBX가 하는 일이 줄어든다.** 남는 건 현재 상태(state)와 트라이, 그리고 각종
 체크포인트/인덱스뿐이다.
@@ -216,10 +253,38 @@ grep -rn "tables::" crates/storage/provider/src/providers/rocksdb/provider.rs \
 | `AccountsHistory` | 주소 → 이 계정이 바뀐 블록 번호들 |
 | `StoragesHistory` | (주소, 슬롯) → 바뀐 블록 번호들 |
 
-**공통점: 전부 인덱스다. 현재 상태는 하나도 없다.**
+셋 다 인덱스이고 현재 상태는 하나도 없다. **다만 "인덱스라서 RocksDB"는 아니다** — MDBX에도
+인덱스가 많다 (`HeaderNumbers`, `BlockBodyIndices`, `TransactionBlocks`).
 
-성격을 더 좁히면 — **랜덤한 키에 대량으로 쓰이는 데이터**다. tx 해시는 균등 분포이고, 블록
-하나가 수백~수천 개의 항목을 한꺼번에 만든다.
+진짜 기준은 **키의 성격 × 블록당 쓰기 볼륨**이다.
+
+| 테이블 | 저장소 | 키 | 키 순서 | 블록당 쓰기 | 방식 |
+|---|---|---|---|---|---|
+| `BlockBodyIndices` | MDBX | `BlockNumber` | **단조 증가** | **1건** | `append` |
+| `TransactionBlocks` | MDBX | `TxNumber` | **단조 증가** | **1건** | `append` |
+| `HeaderNumbers` | MDBX | `BlockHash` | 랜덤 | **1건** | `put` |
+| `TransactionHashNumbers` | **RocksDB** | `TxHash` | 랜덤 | **수백 건** | put |
+| `AccountsHistory` | **RocksDB** | `Address` | 랜덤 | **수천 건** | **read-modify-write** |
+| `StoragesHistory` | **RocksDB** | `(Addr, Slot)` | 랜덤 | **수천 건** | **read-modify-write** |
+
+- MDBX에 남은 인덱스는 **블록당 1건**이다. `TransactionBlocks`는 트랜잭션이 300개여도 마지막
+  tx 번호 하나만 쓴다 (`provider.rs:832-839`)
+- 키가 단조 증가하면 `append`를 쓸 수 있다. `DbTxMut::append` doc: *"typically from O(logN)
+  down to O(1) thanks to no lookup"*. `TxHash`/`Address`로는 불가능
+- history 두 개는 삽입이 아니라 **수정**이다 — 기존 샤드를 읽어서 인덱스를 덧붙인다.
+  B-tree에서 최악의 패턴
+
+v1 시절의 흔적이 코드에 남아 있다 (`provider.rs:677-678`):
+
+```rust
+// Sort by hash for optimal MDBX insertion performance
+all_tx_hashes.sort_unstable_by_key(|(hash, _)| *hash);
+```
+
+랜덤 키를 B-tree에 대량 삽입하는 게 느려서 넣은 우회책이고, **v2에서는 이 블록 전체를 스킵한다**
+— LSM은 memtable에서 어차피 정렬하니까.
+
+> **정정**: "전부 인덱스다"는 관찰이지 설명이 아니다. 기준은 **랜덤 키 × 대량 쓰기**.
 
 RocksDB는 **LSM-tree** 기반이라 이런 쓰기에 강하다. 랜덤 키를 B+tree(MDBX)에 대량 삽입하면
 페이지가 여기저기 쪼개지지만, LSM은 메모리에 모았다가 순차로 flush한다.
@@ -251,12 +316,17 @@ RocksDB가 나오는 건 다른 질문을 할 때다:
 ## 5. 쓰기는 병렬, 커밋은 순차
 
 ```
-save_blocks:  SF ∥ RocksDB ∥ MDBX     ← 병렬. 순서 무관
+save_blocks:  SF ∥ RocksDB ∥ MDBX          ← 병렬. 순서 무관
                     ↓
-commit:       SF → RocksDB → MDBX     ← 순차. 순서가 전부
+commit (정방향):  SF → RocksDB → MDBX      ← 순차. MDBX가 마지막
+commit (언와인드): MDBX → RocksDB → SF      ← 순차. MDBX가 처음
 ```
 
-모순이 아니다.
+**커밋 순서는 하나가 아니라 둘이고, 정반대다** (`provider.rs:3890-3913`, `CommitOrder`).
+어느 쪽이든 MDBX가 기준점이고, 크래시 후 나머지를 MDBX에 맞출 수 있게 순서를 잡는다.
+자세한 건 `concurrency.md` §3.
+
+병렬 쓰기와 순차 커밋은 모순이 아니다.
 
 - **쓰기**는 각 저장소의 버퍼/임시 영역에 쌓는 단계 → 서로 무관하니 병렬 가능
 - **커밋**은 "이제 진짜다"를 확정하는 단계 → 크래시 시점에 따라 결과가 갈리니 순서가 중요
