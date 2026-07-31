@@ -53,11 +53,37 @@ runtime.storage_pool().in_place_scope(|s| {
 })?;
 ```
 
-### `in_place_scope` — 성능이 아니라 컴파일 가능 여부의 문제
+### 왜 MDBX만 호출 스레드가 맡나 — 실용적 이유
 
-rayon-core 1.13 시그니처를 비교하면 차이가 명확하다.
+**호출 스레드는 어차피 세 쓰기가 다 끝날 때까지 블록된다.** 그동안 놀리느니 한 몫을 맡는 게
+낫고, 그 몫으로 MDBX가 자연스럽다:
+
+1. **세 구간 중 가장 길고 `?`가 열 곳이 넘는다.** 스코프 클로저가 `Result`를 반환하도록
+   해놨기 때문에(`provider.rs:760`의 `Ok::<_, ProviderError>(())` + `})?`) `?`를 그냥 쓴다.
+   `spawn`된 쪽은 클로저가 `()`를 반환해야 해서 결과를 `Option`에 담았다 나중에 꺼낸다:
+   ```rust
+   timings.sf = sf_result.ok_or(StaticFileWriterError::ThreadPanic("static file"))??;
+   ```
+2. 스레드 핸드오프 한 번을 아낀다.
+
+### `in_place_scope`는 새로 도입한 게 아니라 옮겨온 것
+
+git 히스토리가 순서를 말해준다.
+
+| 날짜 | 커밋 | 내용 |
+|---|---|---|
+| 2025-12-22 | `chore(db): Remove Sync from DbTx (#20516)` | `DbTx`/`DbTxMut`에서 **`Sync` 제거** (45개 파일) |
+| 2026-01-15 | `feat: parallelize save_blocks (#20993)` | **병렬 쓰기 도입.** `std::thread::scope` + OS 스레드 |
+| 2026-02-06 | `perf: use separate pool for save_blocks (#21764)` | 전용 rayon 풀로 이전. `thread::scope` → `in_place_scope` |
+
+원래는 `std::thread::scope`였고, **그것도 클로저에 `Send`를 요구하지 않는다**:
 
 ```rust
+// std
+pub fn scope<'env, F, T>(f: F) -> T
+where F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,   // Send 없음
+
+// rayon-core 1.13
 pub fn scope<'scope, OP, R>(op: OP) -> R
 where OP: FnOnce(&Scope<'scope>) -> R + Send,    // ← 클로저가 Send여야 함
       R: Send,
@@ -66,15 +92,13 @@ pub fn in_place_scope<'scope, OP, R>(op: OP) -> R
 where OP: FnOnce(&Scope<'scope>) -> R,           // ← Send 요구 없음
 ```
 
-`in_place_scope`는 **클로저 본문을 호출 스레드에서 실행하므로** `Send`를 요구하지 않는다.
+`in_place_scope`는 **본문을 호출 스레드에서 그대로 실행**하므로 `std::thread::scope`와 동작이
+같다. 풀을 바꾸면서 구조를 그대로 옮길 수 있어서 고른 것이지,
+**"rayon `scope`를 쓰려다 컴파일이 안 돼서 도망친" 상황은 애초에 없었다.**
 
-여기서는 클로저가 `&self`를 캡처하는데, 아래 §"MDBX만 `spawn`이 없는 이유"에서 보듯
-`&DatabaseProvider<TX,N>`은 `Send`가 아니다. 즉 **`scope`를 썼다면 애초에 컴파일이 안 된다.**
-"호출 스레드를 놀리지 않는다"는 부수 효과이지 선택 이유가 아니다.
+`spawn`한 작업이 전부 끝나야 반환되는 것(암묵적 배리어)은 셋 다 공통이다.
 
-`spawn`한 작업이 전부 끝나야 반환되는 것(암묵적 배리어)은 양쪽 공통이다.
-
-### MDBX만 `spawn`이 없는 이유 — 컴파일이 안 된다
+### 타입 시스템이 이 구조를 강제한다 — 반대로 하려 해도 컴파일이 안 된다
 
 `save_blocks`가 속한 impl 블록(`provider.rs:510`):
 
@@ -143,20 +167,29 @@ mod tests {
 > 바운드에 안 적었으면 컴파일러에게는 없는 성질이다.
 
 따라서 정확히는 **"물리적으로 불가능"이 아니라 "현재 선언된 바운드에서는 불가능"** 이다.
-impl 블록에 `+ Sync`를 추가하면 컴파일은 통과할 것이다. 넓히지 않은 건 넓힐 이유가 없어서일
-것이고, 그 위에 얹히는 부가 이유가 둘 더 있다:
 
-1. **스코프 클로저가 `Result`를 반환한다** (`provider.rs:760`의 `Ok::<_, ProviderError>(())` +
-   `})?`). 그래서 MDBX 구간은 `?`를 열 번 넘게 그냥 쓴다. `spawn`한 둘은 클로저가 `()`를
-   반환해야 해서 결과를 `Option`에 담아뒀다 나중에 꺼낸다:
-   ```rust
-   timings.sf = sf_result.ok_or(StaticFileWriterError::ThreadPanic("static file"))??;
-   ```
-2. **`in_place_scope`니까 호출 스레드가 놀면 손해다.** 작업 3개를 전부 `spawn`하면 호출
-   스레드는 대기만 한다.
+### 그 바운드는 의도적으로 좁혀진 것이다 ★
 
-> 참고: 락이 있으니 `Sync`가 **불필요**한 게 아니라, 락이 있으니 `Sync`가 **안전(sound)** 한 것이다.
-> `unsafe impl`은 "내가 책임진다"는 선언이고 그 근거가 락이다.
+`#20516`의 diff를 보면 방향이 분명하다:
+
+```rust
+-pub trait DbTx: Debug + Send + Sync {
++pub trait DbTx: Debug + Send {
+     type Cursor<T: Table>: DbCursorRO<T> + Send + Sync;   // ← 커서는 Sync 유지
+```
+
+**트랜잭션은 `Sync`를 잃었지만 커서는 유지했다.** 그리고 `Database::TX`/`TXMut` 바운드에는
+`Sync`가 남아 있다 — 요구가 사라진 게 아니라 **필요한 지점으로 이동**했다.
+
+즉 *"트랜잭션 객체를 여러 스레드가 동시에 공유할 일은 없다"* 는 판단을 트레이트 바운드에
+새긴 것이고, 한 달 뒤 들어온 병렬 쓰기는 그 판단 **위에서** 설계됐다.
+
+> **컴파일 에러는 원인이 아니라 그 방침을 지키게 해주는 난간이다.**
+> 설계 순서는 "성능이 목표 → 구조가 결정 → 타입 시스템이 난간"이지,
+> "제약이 있어서 어쩔 수 없이 이렇게 됐다"가 아니다.
+
+참고: 락이 있으니 `Sync`가 **불필요**한 게 아니라, 락이 있으니 `Sync`가 **안전(sound)** 한 것이다.
+`unsafe impl`은 "내가 책임진다"는 선언이고 그 근거가 락이다.
 
 ---
 
