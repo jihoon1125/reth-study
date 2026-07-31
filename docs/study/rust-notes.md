@@ -1,10 +1,70 @@
 # Rust 개념 노트
 
 > reth 읽으면서 만난 문법을 계속 쌓는 파일. 주차별 분석 문서와 분리해서 관리한다.
+> 본문은 **개념별**로 정렬한다 — 같은 개념이 여러 주에 걸쳐 깊어지므로 주차로 쪼개지 않는다.
+> 각 절 아래 `> N주차 X`는 그 개념을 처음 만난 시점이고, 시간순 뷰는 아래 목록이다.
+
+---
+
+## 주차별 습득 목록
+
+> 블로그 글감 뽑을 때 여기부터. ★ = 글 하나로 뺄 만한 것
+
+### 8주차 — storage/provider 구조 분석
+
+**월 (data-structures)**
+- 제네릭 / 트레이트 바운드
+- 연관 타입 ★ — 트레이트 안의 "타입 구멍"
+- 공유와 가변
+- 타입 별칭 vs newtype
+- `#[auto_impl(&, Arc, Box)]`
+- Future / Pin — 자기참조와 이동
+- MDBX 계층 구조
+
+**화 (fn-analysis-1)**
+- 연관 타입 바운드 ≠ 트레이트 상속 ★ — `DbTx`/`DbTxMut`이 상속이 아닌데 RW에 읽기 impl이 걸리는 이유
+- turbofish `::<T>` ★ — 테이블을 값이 아니라 타입으로 넘기기
+- `?` vs `map_err` — 벗기기 vs 에러 타입 갈아끼우기
+- `.transpose()`
+- 클로저
+
+**수 (concurrency)**
+- 트레이트 객체 `dyn Trait`
+- blanket impl — 바운드는 요구, blanket impl은 공급
+- let-else
+- Mutex ★ — 데이터 보호 vs 작업 직렬화
+- 원자 변수와 `Ordering` — `Relaxed`가 보장하는 것을 과소평가하지 말 것
+- `extern "C" fn`
+
+**목 (data-flow)**
+- `unsafe impl Send` / `unsafe impl Sync`
+- 제네릭 컨텍스트에서는 선언된 바운드만이 진실이다 ★
+- `scope` — 클로저가 바깥 변수를 수정할 수 있는 이유
+- `#[derive(EnumIs)]`
+
+**금 (design-intent)**
+- GAT ★★ — 언어 기능 하나가 아키텍처를 가능하게 한 사례. 없으면 `walk`/`walk_range`를 통째로 잃는다
+- `for<...>` HRTB는 라이프타임 전용이다
+- 메서드는 struct가 아니라 (타입, 트레이트) 쌍에 속한다 ★
+- 오브젝트 안전성과 `where Self: Sized`
+- `Mutex<T>`는 `T`가 `Sync`가 아니어도 `Sync`다
+- 바운드는 없앨 수 있지만 요구는 이동할 뿐이다 ★
+- `scope` vs `in_place_scope` — 차이는 `Send` 바운드 (수요일 서술 정정)
+- `Address`(newtype 2겹) vs `B256`(별칭 1겹) / `#[repr(transparent)]` / deref coercion
+- MDBX 스레드 종속성 / 뮤텍스는 트랜잭션당 하나 / `TxnManager`
+
+### 9주차 — storage/provider 심층
+
+**월 (fn-analysis-2)**
+- `PhantomData` — 값은 없고 타입만 있는 자리
+- `FnOnce` / `FnMut` / `Fn` ★ — 바운드 비대칭이 호출 횟수를 문서화한다
+- let-chain — `if let ... && let ...` (Rust 2024)
 
 ---
 
 ## 제네릭 / 트레이트 바운드
+
+> 8주차 월
 
 ```rust
 struct Foo<T>            // T는 아직 안 정해진 타입 자리
@@ -21,6 +81,8 @@ struct Foo<T: Display>   // T에 조건(트레이트 바운드)
 ---
 
 ## 연관 타입 (associated type) ★
+
+> 8주차 월 · 금(GAT로 이어짐)
 
 트레이트 안에 선언하는 **"타입 구멍"**. 구현체가 채운다.
 
@@ -87,6 +149,8 @@ reth 전체에 이 패턴이 깔려 있음.
 
 ## 연관 타입 바운드 ≠ 트레이트 상속 ★
 
+> 8주차 화
+
 혼동하기 쉬운 두 가지.
 
 ```rust
@@ -111,6 +175,8 @@ pub trait Database {
 ---
 
 ## ★ GAT (Generic Associated Type)
+
+> 8주차 금 · 월의 연관 타입에서 이어짐
 
 **자기 제네릭 파라미터를 가진 연관 타입.** 빈칸이 함수처럼 인자를 받는다.
 
@@ -159,6 +225,8 @@ impl<TX: for<T: Table> DbTxCursor<T>> ...                           // ❌ 문�
 
 ## ★ 메서드는 struct가 아니라 (타입, 트레이트) 쌍에 속한다
 
+> 8주차 금
+
 흔한 오해: "impl을 여러 개 하면 struct 아래에 메서드가 쫘라락 평평하게 붙는다."
 
 ```
@@ -203,6 +271,8 @@ let x = 1u8.into();        // ❌ type annotations needed
 
 ## turbofish `::<T>`
 
+> 8주차 화
+
 함수에 **값이 아니라 타입**을 넘기는 문법.
 
 ```rust
@@ -234,7 +304,41 @@ tx.get::<PlainAccountState>(some_b256)  // ❌ 컴파일 에러
 
 ---
 
+## `PhantomData` — 값은 없고 타입만 있는 자리
+
+> 9주차 월
+
+```rust
+pub struct EthStorage<T = TransactionSigned, H = Header>(PhantomData<(T, H)>);
+```
+
+`EthStorage`는 **필드가 없다.** 상태를 아무것도 안 든다. 그런데 제네릭 `T`, `H`는 필요하다 —
+"어떤 트랜잭션 타입, 어떤 헤더 타입을 다루는 저장소인가"를 타입으로 구분해야 하니까.
+
+문제는 러스트가 **선언하고 안 쓰는 제네릭 파라미터를 컴파일 에러로 막는다**는 것이다.
+
+```rust
+pub struct EthStorage<T, H>;   // ❌ error: parameter `T` is never used
+```
+
+`PhantomData<(T, H)>`는 "이 타입을 쓰긴 쓴다(실체는 없지만)"는 표식이다. **런타임 크기 0.**
+
+### 왜 안 쓰는 파라미터를 막는가
+
+러스트는 타입 파라미터로부터 **변성(variance)·drop 검사·auto trait(`Send`/`Sync`)** 을
+추론한다. 파라미터가 어디에도 안 나타나면 그 추론의 근거가 없어서 컴파일러가 어느 쪽으로
+가정할지 정할 수 없다.
+
+`PhantomData<T>`를 두면 **"이 struct는 `T`를 소유한 것처럼 취급하라"** 가 되어 추론이 성립한다.
+
+turbofish 절의 "테이블 = 타입"과 같은 계열이다. 값이 아니라 타입으로 구분하면 잘못된 조합이
+컴파일 단계에서 걸린다.
+
+---
+
 ## `?` vs `map_err` ★
+
+> 8주차 화
 
 ```rust
 tx.get(dbi, key)                               // Result<Option<Bytes>, mdbx::Error>
@@ -250,6 +354,8 @@ tx.get(dbi, key)                               // Result<Option<Bytes>, mdbx::Er
 
 ## `.transpose()`
 
+> 8주차 화
+
 `Option<Result<T, E>>` ↔ `Result<Option<T>, E>` 뒤집기.
 
 ```rust
@@ -258,6 +364,8 @@ opt_bytes.map(decode)   // Option<Result<Account, E>>  "있으면 디코딩했�
 ```
 
 ## 클로저 `|x| { ... }`
+
+> 8주차 화
 
 익명 함수.
 
@@ -270,7 +378,53 @@ self.execute_with_operation_metric(op, None, |tx| { tx.get(...) })
 
 ---
 
+## 클로저 종류 — `FnOnce` / `FnMut` / `Fn`
+
+> 9주차 월
+
+| 트레이트 | 호출 | 캡처한 값을 |
+|---|---|---|
+| `FnOnce` | 한 번만 | 소유권을 가져가 **소비** 가능 |
+| `FnMut` | 여러 번, 가변 | 빌려서 **수정** |
+| `Fn` | 여러 번, 불변 | 빌려서 **읽기만** |
+
+포함 관계는 `Fn` ⊂ `FnMut` ⊂ `FnOnce`. `Fn`인 클로저는 `FnOnce` 자리에 넣을 수 있지만 반대는
+안 된다.
+
+클로저가 셋 중 무엇을 구현하는지는 **본문이 캡처한 값을 어떻게 쓰는지로 자동 결정된다.**
+읽기만 하면 `Fn`, 수정하면 `FnMut`, 소비하면 `FnOnce`.
+
+### ★ 바운드로 쓸 때는 방향이 뒤집힌다
+
+- `S: FnOnce` = **느슨한 요구.** "한 번만 부를 거니 아무 클로저나 주세요"
+- `M: Fn` = **빡센 요구.** "여러 번 부를 수 있으니 그래도 되는 클로저만 주세요"
+
+포함 관계가 넓은 쪽(`FnOnce`)이 바운드로는 **더 관대하다.** 헷갈리기 쉬운 지점.
+
+### 실례 — 비대칭이 문서 역할을 한다
+
+`consistent.rs:428`은 클로저 둘을 받는데 바운드가 다르다.
+
+```rust
+S: FnOnce(&DatabaseProviderRO<..>) -> ProviderResult<R>,   // DB 쪽
+M: Fn(&BlockState<..>) -> ProviderResult<R>,               // 인메모리 쪽
+```
+
+이 함수는 둘 다 한 번씩만 부른다. 차이는 **형제 함수**에서 온다 —
+`get_in_memory_or_storage_by_block_range_while`에서는 인메모리 쪽이 블록마다 **N번** 불리고
+(`consistent.rs:232`), DB 쪽은 범위를 통째로 넘겨 한 번만 불린다. 단일 블록 버전은 그 형제와
+모양을 맞춘 것이다.
+
+실제 호출부의 `M` 자리 클로저는 전부 빌려 읽기만 해서 `Fn`이 자동 만족되므로 걸리는 데가 없다.
+
+> **필요해서가 아니라 의도를 문서화한 바운드.** "이 자리는 여러 번 불릴 수 있는 자리다"를
+> 타입으로 적어둔 것.
+
+---
+
 ## 공유와 가변
+
+> 8주차 월
 
 | 표현 | 의미 |
 |---|---|
@@ -283,6 +437,8 @@ self.execute_with_operation_metric(op, None, |tx| { tx.get(...) })
 ---
 
 ## 트레이트 객체 `dyn Trait`
+
+> 8주차 수 · 금(오브젝트 안전성 추가)
 
 ```rust
 reader_txn_tracker: Option<Arc<dyn ReaderTxnTracker>>
@@ -314,6 +470,8 @@ GAT 없이 커서를 트레이트 오브젝트로 만들 수 없는 이유 중 �
 
 ## blanket impl
 
+> 8주차 수
+
 ```rust
 impl<DB: Database> ReaderTxnTracker for DB { ... }
 ```
@@ -324,6 +482,8 @@ impl<DB: Database> ReaderTxnTracker for DB { ... }
 
 ## let-else
 
+> 8주차 수
+
 ```rust
 let Some(sync_state) = &self.read_only_sync else { return Ok(()) };
 ```
@@ -331,7 +491,33 @@ let Some(sync_state) = &self.read_only_sync else { return Ok(()) };
 `Some`이면 꺼내서 바인딩, 아니면 `else` 실행. `else` 블록은 **반드시 함수를 벗어나야** 한다
 (return/break/panic). 중첩 없이 조기 반환하는 관용구.
 
+## let-chain
+
+> 9주차 월
+
+```rust
+if let Some(block_number) = self.convert_hash_or_number(id)? &&
+    let Some(body) = self.block_body_indices(block_number)?
+{
+```
+
+`if let`을 `&&`로 잇는 문법 (Rust 2024 에디션에서 안정화). 예전에는 중첩해야 했다.
+
+```rust
+if let Some(block_number) = ... {
+    if let Some(body) = ... {   // 한 단계 더 들어감
+```
+
+일반 `&&`와 다른 점: **왼쪽에서 벗겨낸 이름을 오른쪽에서 바로 쓸 수 있다.** 순서 의존이 있다.
+(단락 평가는 동일 — 왼쪽이 실패하면 오른쪽은 평가되지 않는다.)
+
+`let-else`와 짝이다. 조기 반환이면 `let-else`, 조건 여러 개를 이어붙일 때는 let-chain.
+
+---
+
 ## Mutex — 데이터 보호 vs 작업 직렬화
+
+> 8주차 수
 
 ```rust
 sync_lock: Mutex<()>    // 안이 비어 있다
@@ -350,6 +536,8 @@ lock().unwrap_or_else(|e| e.into_inner())
 `into_inner()` = "오염 무시하고 데이터 줘". 보호할 데이터가 없는 `Mutex<()>`라면 적절한 처리.
 
 ## 원자 변수와 `Ordering`
+
+> 8주차 수
 
 `Ordering`은 **"이 원자 연산 주변의 다른 메모리 연산까지 순서를 보장할 것인가"** 를 정한다.
 
@@ -383,6 +571,8 @@ B:  flag == true 확인 → 데이터 읽음 → ❌ 아직 옛 데이터일 수
 발행은 다른 락/자료구조가 담당하고 원자 변수는 **힌트로만** 쓰면 안전하다.
 
 ## `unsafe impl Send` / `unsafe impl Sync`
+
+> 8주차 목 · 금(표준 규칙·바운드 이동 추가)
 
 "컴파일러야, 안전성은 내가 책임질 테니 통과시켜"라는 선언. 반드시 SAFETY 주석으로 근거를 남긴다.
 
@@ -422,6 +612,8 @@ MDBX 날 핸들(`*mut MDBX_txn`)은 스레드 안전하지 않다. 그래서 러
 
 ## ★ 제네릭 컨텍스트에서는 선언된 바운드만이 진실이다
 
+> 8주차 목
+
 ```rust
 impl<TX: DbTx + DbTxMut + 'static, N: ...> DatabaseProvider<TX, N> {
 //      ^^^^^^^^^^^^^^^^^^^^^^^^^ Sync 없음
@@ -455,6 +647,8 @@ s.spawn(|_| { sf_provider.write(...) });        // tx는 캡처되지 않음
 ```
 
 ## `scope` — 클로저가 바깥 변수를 수정할 수 있는 이유
+
+> 8주차 목 · 금(in_place_scope 정정)
 
 ```rust
 let mut sf_result = None;
@@ -499,9 +693,13 @@ where OP: FnOnce(&Scope<'scope>) -> R,           // ← Send 불필요
 
 ## `#[derive(EnumIs)]`
 
+> 8주차 목
+
 `is_database()`, `is_static_file()` 같은 variant 판별 함수를 자동 생성.
 
 ## `extern "C" fn`
+
+> 8주차 수
 
 C 라이브러리가 러스트 함수를 **거꾸로 호출**하는 콜백. 예: libmdbx가 "느린 리더 발견했는데
 어떻게 할까?"를 러스트에 묻는 `handle_slow_readers`.
@@ -509,6 +707,8 @@ C 라이브러리가 러스트 함수를 **거꾸로 호출**하는 콜백. 예:
 ---
 
 ## 타입 별칭 vs newtype
+
+> 8주차 월 · 금(Address 실례·repr·deref coercion 추가)
 
 ```rust
 type A = B;      // 그냥 줄임말(typedef). 새 타입이 아님
@@ -583,11 +783,15 @@ self.tx.get_by_encoded_key::<tables::PlainAccountState>(address)   // address: &
 
 ## `#[auto_impl(&, Arc, Box)]`
 
+> 8주차 월
+
 매크로. "`T`가 이 트레이트를 구현하면 `&T`, `Arc<T>`, `Box<T>`도 자동으로 구현되게 해줘".
 
 ---
 
 ## Future / Pin (async — 나중에 다시)
+
+> 8주차 월
 
 ```rust
 fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>
@@ -636,6 +840,8 @@ struct SelfReferential {
 ---
 
 ## MDBX 계층 구조
+
+> 8주차 월 · 금(스레드 종속성·TxnManager 추가)
 
 ```
 MDBX (엔진 = libmdbx. LMDB의 포크. mmap 기반 임베디드 KV 저장소)
