@@ -701,6 +701,7 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
     }
 
     fn block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Self::Block>> {
+        tracing::debug!(target: "study", ?id, "ConsistentProvider::block");
         self.get_in_memory_or_storage_by_block(
             id,
             |db_provider| db_provider.block(id),
@@ -741,6 +742,7 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
+        tracing::debug!(target: "study", ?id, "ConsistentProvider::sealed_block_with_senders");
         self.get_in_memory_or_storage_by_block(
             id,
             |db_provider| db_provider.sealed_block_with_senders(id, transaction_kind),

@@ -1843,6 +1843,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
     ///
     /// Returns an error if the requested block is below the earliest available history.
     fn block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Self::Block>> {
+        tracing::debug!(target: "study", ?id, "DatabaseProvider::block");
         if let Some(number) = self.convert_hash_or_number(id)? {
             let earliest_available = self.static_file_provider.earliest_history_height();
             if number < earliest_available {
@@ -1916,6 +1917,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
+        tracing::debug!(target: "study", ?id, "DatabaseProvider::sealed_block_with_senders");
         self.recovered_block(
             id,
             transaction_kind,
