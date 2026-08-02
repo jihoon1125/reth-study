@@ -70,12 +70,16 @@ storage_key: Box<B256>,
 
 | 단계 | 코드 | 값 |
 |---|---|---|
-| 1 | `provider.rs:1859` `block()` | `Ok(None)` |
-| 2 | `rpc/rpc-eth-api/src/helpers/block.rs:63` `rpc_block()` | `Ok(None)` |
-| 3 | `rpc/rpc-eth-api/src/core.rs:520` `eth_getBlockByNumber` | `RpcResult<Option<RpcBlock>>` |
+| 1 | `rpc-eth-api/src/core.rs:520` `eth_getBlockByNumber` | `RpcResult<Option<RpcBlock>>` |
+| 2 | `rpc-eth-api/src/helpers/block.rs:63` `rpc_block()` | `let Some(block) = ... else { return Ok(None) }` |
+| 3 | `rpc-eth-api/src/helpers/block.rs:285-292` `recovered_block()` → `block_hash_for_id()` | 해시가 없으면 `Ok(None)` |
 | 4 | JSON 응답 | `{"result": null}` |
 
-`block()`이 `Err`를 내면 4단계가 `{"error": ...}`가 되어 규격 위반이다. 그래서 `Err`를 낼 수 없다.
+어느 단계든 `Err`를 내면 4단계가 `{"error": ...}`가 되어 규격 위반이다.
+
+> ⚠️ **이 경로는 `block()`을 거치지 않는다.** 9주차 목요일에 로그를 찍어 확인했다.
+> 캐시 미스 시 provider를 부르는 지점은 `rpc-eth-types/src/cache/mod.rs:536`이고,
+> 거기서 호출하는 것은 `sealed_block_with_senders`다. 자세한 것은 `observation.md` 참조.
 
 `history_by_block_hash`는 RPC 응답용이 아니라 내부에서 `StateProviderBox`를 만드는 함수라
 반환 타입에 `Option`이 없고, 없으면 `.ok_or(BlockHashNotFound)`로 끝낸다
