@@ -60,6 +60,17 @@
 - `FnOnce` / `FnMut` / `Fn` ★ — 바운드 비대칭이 호출 횟수를 문서화한다
 - let-chain — `if let ... && let ...` (Rust 2024)
 
+### 10주차 — 코어 수정 (rpc 에러, PR #26550)
+
+**화~수 (PR 작업)**
+- `impl From<A> for B`와 `?`의 자동 변환 ★ — 호출부가 없는데 전 경로에서 불리는 함수
+- `thiserror`의 `#[error("...")]` — `Display`를 생성하는 어트리뷰트
+- 유닛 변형 → 구조체 변형은 브레이킹 ★ — `E0533`, 컴파일러가 고칠 곳 전부를 열거해준다
+- `{ .. }`의 두 얼굴 ★★ — 매치할 땐 버리기 / 만들 땐 채우기.
+  **타입 시스템은 "형태가 안 맞는 것"은 잡아도 "정보를 버리는 것"은 못 잡는다**
+
+**부록** — 코드 이력 추적 (git `-L` / `-S` / blame)
+
 ---
 
 ## 제네릭 / 트레이트 바운드
@@ -362,6 +373,120 @@ tx.get(dbi, key)                               // Result<Option<Bytes>, mdbx::Er
 opt_bytes.map(decode)   // Option<Result<Account, E>>  "있으면 디코딩했는데 실패했을 수도"
          .transpose()   // Result<Option<Account>, E>  "실패면 에러, 성공이면 Option"
 ```
+
+## `impl From<A> for B`와 `?`의 자동 변환 ★
+
+> 10주차 화
+
+`?`는 에러 타입이 안 맞으면 **`From`을 찾아서 자동으로 부른다.** 그래서 호출 코드가 하나도
+없는데 프로그램 전체에서 불리는 함수가 생긴다.
+
+```rust
+// crates/rpc/rpc-eth-types/src/error/mod.rs:547
+impl From<reth_errors::ProviderError> for EthApiError {
+    fn from(error: ProviderError) -> Self {
+        match error {
+            ProviderError::BlockExpired { requested, earliest_available } =>
+                Self::PrunedHistoryUnavailable { requested, earliest_available },
+            err => Self::Internal(err.into()),
+        }
+    }
+}
+```
+
+```bash
+grep -rn "EthApiError::from" crates/rpc   # 거의 안 나온다
+```
+
+`ProviderError`를 돌려주는 함수에 `?`를 붙이고 반환 타입이 `Result<_, EthApiError>`이면
+러스트가 이 `From`을 끼워 넣는다. **provider 에러가 RPC 에러로 바뀌는 지점이 문법 하나에
+숨어 있다.**
+
+> 8주차의 `map_err`와 짝. `map_err`는 손으로 갈아끼우는 것이고, `From`이 있으면 `?`가 알아서
+> 한다.
+
+## `thiserror`의 `#[error("...")]`
+
+> 10주차 화
+
+`impl Display`를 통째로 생성하는 어트리뷰트. 포맷 문법은 `println!`과 같고,
+**변형의 필드 이름을 그대로 인자로 쓴다.**
+
+```rust
+#[error("pruned history unavailable: requested {requested}, earliest available {earliest_available}")]
+PrunedHistoryUnavailable { requested: u64, earliest_available: u64 },
+```
+
+메시지를 만드는 곳은 여기 한 곳뿐이다. `error.to_string()`을 부르는 쪽은 안 고쳐도 새 문구가
+나간다.
+
+| 형태 | 뜻 |
+|---|---|
+| `#[error("...{field}...")]` | 이름 있는 필드 |
+| `#[error("...{0}...")]` | 튜플 변형의 0번 |
+| `#[error(transparent)]` | 안쪽 에러의 `Display`를 그대로 통과 |
+
+## 유닛 변형 → 구조체 변형은 브레이킹 체인지 ★
+
+> 10주차 화
+
+```rust
+PrunedHistoryUnavailable,                          // 유닛 변형
+PrunedHistoryUnavailable { requested: u64, … },    // 구조체 변형
+```
+
+**둘은 문법상 쓰는 법이 다르다.** 유닛 변형은 값 그 자체지만, 구조체 변형은 중괄호로 필드를
+채워야 값이 된다. 그래서 기존 사용처가 전부 `E0533`이 된다.
+
+```
+error[E0533]: expected value, found struct variant `EthApiError::PrunedHistoryUnavailable`
+   --> crates/rpc/rpc/src/trace.rs:373:24
+```
+
+타입이 아니라 **문법 단계**에서 걸리므로 `.into()`로 감싸져 있든 `return Err(...)` 안이든
+전부 잡힌다. 정의 한 곳을 고치고 `cargo check`를 돌리면 컴파일러가 고칠 곳 전부를 열거해준다
+— grep보다 확실하다. **컴파일이 통과했다는 사실이 곧 "빠진 곳 없음"의 증명이다.**
+
+## `{ .. }`의 두 얼굴 ★
+
+> 10주차 화
+
+같은 문법이 위치에 따라 정반대 뜻이다.
+
+```rust
+// 매치할 때 — "종류만 보고 필드는 안 꺼낸다"
+ProviderError::BlockExpired { .. } => ...
+
+// 만들 때 — 필드를 채운다
+EthApiError::PrunedHistoryUnavailable { requested, earliest_available }
+```
+
+### 부분 이동이 일어나지 않는다
+
+`{ .. }`는 **아무것도 바인딩하지 않아서** 매치 대상이 부분 이동되지 않는다. 그래서 팔 안에서
+원본을 다시 통째로 쓸 수 있다.
+
+```rust
+fn from(error: EthApiError) -> Self {
+    match error {
+        EthApiError::PrunedHistoryUnavailable { .. } =>
+            rpc_error_with_code(4444, error.to_string()),   // ← error를 다시 쓴다. 컴파일된다
+```
+
+`{ requested, .. }`처럼 하나라도 꺼냈으면 이게 안 된다.
+
+### 컴파일러가 못 잡는 쪽
+
+```rust
+ProviderError::BlockExpired { .. } => Self::PrunedHistoryUnavailable,   // 정보를 버린다
+```
+
+`{ .. }`는 **"의도적으로 안 쓴다"는 선언**이라 경고가 없다. 바인딩을 만든 적이 없으니
+`unused` 대상도 아니다.
+
+> **타입 시스템은 "형태가 안 맞는 것"은 잡지만 "정보를 버리는 것"은 못 잡는다.**
+> 필드를 추가하면 사용처 5곳을 전부 잡아주는데, 필드를 안 쓰면 아무 말도 안 한다.
+> 이 비대칭이 reth의 이 버그가 7개월 살아남은 이유다.
 
 ## 클로저 `|x| { ... }`
 
@@ -953,3 +1078,103 @@ fn lock(&self) -> MutexGuard<'_, ()> {
 `begin_rw_txn`은 FFI를 직접 부르지 않고 `mdbx-rs-txn-mgr` 스레드에 메시지를 보내 대기한다
 (`txn_manager.rs:66-114`). 반면 `begin_ro_txn`은 **호출 스레드에서 직접** `mdbx_txn_begin_ex`를
 부른다(`transaction.rs:72-83`). writer 락 획득을 한 곳에 모으려는 구조로 보인다.
+---
+
+# 부록 — 코드 이력 추적 (git)
+
+> 10주차. "왜 이렇게 돼 있나"를 추측 대신 확인하는 법.
+
+## `git log --oneline`
+
+`--oneline`은 커밋 하나를 **짧은 sha + 제목** 한 줄로 압축하는 출력 옵션이다. 기능은 없다.
+실제 힘은 뒤에 붙는 것들에 있다.
+
+## `-L` — 특정 줄 범위의 이력
+
+```bash
+git log --oneline -L 82,94:crates/rpc/rpc-eth-types/src/error/mod.rs
+```
+
+```
+6ddc756489 feat: introduce RPC error for pruned history (#16780)   ← 이 변형이 생긴 커밋
+7a20b413f5 feat: Include missing block id in error responses (#7416)
+e05dba69ce chore: rewrite all error messages for consistency (#5176)
+```
+
+**파일 이름이 바뀌고 줄 번호가 밀려도 따라간다.** 함수 단위로도 된다.
+
+```bash
+git log -L :block:crates/storage/provider/src/providers/database/provider.rs
+```
+
+## `-S` / `-G` — diff 내용으로 찾기
+
+```bash
+git log --oneline -S "PrunedHistoryUnavailable" -- crates/rpc
+```
+
+| | 걸리는 커밋 |
+|---|---|
+| `-S` | 그 문자열의 **개수가 바뀐** 커밋 (추가/삭제) |
+| `-G` | diff에 그 **패턴이 나타나는** 커밋 (이동·수정 포함) |
+
+`-S`가 노이즈가 적다. `-- 경로`로 범위를 좁히는 게 핵심.
+
+## `git blame -L`
+
+```bash
+git blame -L 82,94 --date=short crates/rpc/rpc-eth-types/src/error/mod.rs
+```
+
+```
+6ddc756489b (Matthias Seitz  2025-06-12 82) /// Thrown when historical data is not available...
+e61333f0fef (Soubhik S.M.    2026-07-19 88) #[error("Pruned history unavailable")]
+6ddc756489b (Matthias Seitz  2025-06-12 89) PrunedHistoryUnavailable,
+```
+
+- `-w` — 공백만 바뀐 변경 무시 (포매팅 커밋이 blame을 덮는 걸 걷어낸다)
+- `-C` — 다른 파일에서 복사돼 온 줄도 추적
+
+## 커밋 → PR → 이슈
+
+reth는 머지 커밋 제목 끝에 PR 번호가 박힌다.
+
+```
+6ddc756489 feat: introduce RPC error for pruned history (#16780)
+                                                         ^^^^^^
+```
+
+```
+커밋 제목의 (#16780) → PR 본문 → "Closes #20038" → 원본 이슈
+```
+
+`gh`가 없으면:
+
+```bash
+curl -s "https://api.github.com/repos/paradigmxyz/reth/pulls/21270" \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['title']);print(d['body'])"
+```
+
+## 실제로 쓰는 순서
+
+```bash
+git log --oneline -L <시작>,<끝>:<파일>   # 1. 이 줄들이 어떻게 변해왔나
+git show <sha>                            # 2. 수상한 커밋을 통째로 본다
+                                          # 3. 제목의 (#NNNN)으로 PR을 연다
+```
+
+**`git show`가 중요하다.** 커밋을 통째로 보면 "이 변경과 저 변경이 같이 들어갔다"가 보인다.
+10주차 결정적 근거였던 "숫자를 담는 코드와 버리는 코드가 같은 커밋"도 `git show 2305c3ebeb`으로
+확인한 것이다.
+
+## VSCode
+
+| 하고 싶은 것 | 방법 |
+|---|---|
+| 파일 이력 대충 보기 | Timeline (Explorer 하단, 설치 불필요) |
+| 브랜치 구조 확인 | Git Graph 확장 |
+| **이 줄이 왜 이렇게 됐나** | GitLens `Open Line History` = `git log -L`의 UI |
+| 커밋 → PR → 이슈 타기 | GitHub 웹 blame (파일 페이지에서 `b` 키) |
+
+GitHub blame의 **"View blame prior to this change"** 버튼은 포매팅 커밋에 가려진 진짜 원저자를
+찾아 들어갈 때 유일한 방법이다.
