@@ -1,8 +1,11 @@
 # forkchoiceUpdated 한 번이 어디까지 가나
 
-> 12주차 화요일. 스펙이 코드에서 어떻게 구현됐는지 추적. 그런데 추적하다가 **8~11주차에
+> 12주차 화~수. 스펙이 코드에서 어떻게 구현됐는지 추적. 그런데 추적하다가 **8~11주차에
 > 몰랐던 개념이 계속 나왔다** — 다운로드가 P2P라는 것, stage가 언제 도는지, 리오르그가 되감기가
-> 아니라는 것. 그것들을 먼저 정리한다.
+> 아니라는 것. 그것들을 먼저 정리한다(§1~10).
+>
+> 스펙 대조는 §11부터. 제일 깊이 판 것은 §13 — **스펙이 규정하지 않은 지점을 찾은 것**이고,
+> 그게 금요일 Phase 4 리허설의 본체가 된다.
 
 ---
 
@@ -792,29 +795,328 @@ let unwind_to = local_head.block.number
 
 ---
 
-## 11. 스펙 대조 중간 결과
+## 11. ★ "VALID"의 두 가지 의미
 
-| # | 스펙 | 코드 | 판정 |
+§2(용어)에 붙는 내용인데, 스펙 대조를 하다가 걸려서 여기 적는다.
+
+> finalized가 정본 체인에 없으면 뭐가 valid하지 않은 건가?
+
+**아무것도 invalid하지 않다.** 그게 답이다.
+
+| | 무엇을 검사 | 단위 | 스펙 |
 |---|---|---|---|
-| 1 | fcU §6 `-38006 Too deep reorg` — "the limitation **specific to the client software**" | `grep -rn "38006\|TooDeepReorg\|too deep"` → **0건** | ⚠️ **미구현.** reth는 제한을 두지 않는다 |
-| 2 | fcU §7 "MUST be made **atomically**" | 미확인 | 수요일 |
-| 3 | fcU §8.3 "MUST NOT be rolled back" | `engine_api.rs:918` + `process_payload_attributes` 문서 | ✅ **두 계층에서** |
-| 4 | validation §4 "MUST be **idempotent**" | `InvalidHeaderCache` (`invalid_headers.rs:11`) — 재검증 자체를 안 한다 | ✅ 확인 |
-| 5 | Sync note "**implementation dependent**" | staged sync 파이프라인이 그 자리 | ✅ 스펙이 비운 자리 |
-| 6 | validation §6 "MUST NOT be affected by an active sync process on a **side branch**" | 미확인 | 수요일 |
-| 7 | fcU §2 skip 허용 범위 | 주석은 "ancestor of the **head of canonical chain**", 스펙은 "ancestor of the latest known **finalized** block" | ⚠️ **문구 불일치.** reth가 더 넓게 skip |
-| 8 | (스펙에 없음) | 초기 fcU에서 `safe`를 동기화 목표로 사용 (`tree/mod.rs:1388`) | ⚠️ **reth만의 선택** |
+| **블록의 유효성** (payload validity) | 이 블록이 규칙에 맞나 | **블록 하나** | `newPayload`, validation §1~6 |
+| **forkchoiceState의 정합성** | 세 해시가 한 사슬 위에 있나 | **블록 사이의 관계** | fcU §5 |
 
-**1번이 금요일 목표("스펙이 클라이언트에 맡긴 지점")의 답이다** — 맡겼는데 reth는 제한을 두지
-않는 쪽을 골랐다.
+```
+        ┌── (101,0xAA) ── (102,0xAB)   ← head = 0xAB
+(100)───┤
+        └── (101,0xBB)                 ← finalized = 0xBB
+```
 
-> `MIN_BLOCKS_FOR_PIPELINE_RUN = 32`를 한계값으로 착각하면 안 된다. 그건 **파이프라인 발동
-> 문턱**이고 리오르그를 **거부**하는 값이 아니다. 깊으면 파이프라인으로 처리할 뿐 에러를 내지
-> 않는다.
+`0xAB`도 `0xBB`도 **유효한 블록**이다. 그런데 "0xAB를 head로, 0xBB를 finalized로"는 **불가능한
+요구**다 — 0xBB가 0xAB의 조상이 아니니까.
+
+**§5가 잡는 건 "블록이 나쁘다"가 아니라 "CL이 모순된 지시를 보냈다"다.** 에러 이름이 그것을
+말한다 — `Invalid block`이 아니라 **`Invalid forkchoice state`**. 나쁜 것은 블록이 아니라
+**세 해시의 조합**이다.
+
+### 블록 유효성 검사도 두 층이다
+
+| | 검사 | 필요한 것 | 스펙 |
+|---|---|---|---|
+| **자기 완결적** | 트랜잭션 길이 ≠ 0 / `blockHash == Keccak256(RLP(header))` | payload 안만 | newPayload §1, §2 (**MUST 무조건**) |
+| **문맥 필요** | 실행 후 `stateRoot`/`receiptsRoot`/`gasUsed` 대조 | **부모 상태 전체** | newPayload §4 → validation §3 (조건부) |
+
+그래서 §1~2는 *"MUST run this validation in all cases even if … in an active sync process"*이고
+§4는 조건부다. **§7의 "payloads … are VALID"는 이 표의 얘기**이고 §5의 조건은 체인 관계 얘기다.
+층이 다르다.
 
 ---
 
-## 12. 오늘의 수확
+## 12. 리오르그를 실제로 적용하는 함수
+
+`tree/mod.rs:2718-2756` `on_canonical_chain_update`
+
+```rust
+fn on_canonical_chain_update(&mut self, chain_update: NewCanonicalChain<N>) {
+    // update the tracked canonical head
+    self.state.tree_state.set_canonical_head(chain_update.tip().num_hash());     // ①
+
+    let tip = chain_update.tip().clone_sealed_header();                          // ②
+    let notification = chain_update.to_chain_notification();                     // ③
+
+    // reinsert any missing reorged blocks
+    if let NewCanonicalChain::Reorg { new, old } = &chain_update {               // ④
+        self.state.set_pending_sparse_trie_prune(false);
+        self.update_reorg_metrics(old.len(), old_first);
+        self.reinsert_reorged_blocks(new.clone());
+        self.reinsert_reorged_blocks(old.clone());                              // ★ old도 넣는다
+    }
+
+    // update the tracked in-memory state with the new chain
+    self.canonical_in_memory_state.update_chain(chain_update);                   // ⑤
+    self.canonical_in_memory_state.set_canonical_head(tip.clone());              // ⑥
+    ...
+    self.canonical_in_memory_state.notify_canon_state(notification);             // ⑦
+```
+
+어제 본 다섯 개 주석(`// Performing a FCU involves:`)의 실물이다.
+
+**head를 두 곳에 갱신한다.**
+
+| 단계 | 어디 | 누구를 위한 것 |
+|---|---|---|
+| ① | `self.state.tree_state` | 엔진 트리 내부 |
+| ⑥ | `self.canonical_in_memory_state` | **provider가 읽는 쪽** ← 8~9주차와 만나는 지점 |
+
+### `reinsert_reorged_blocks(old)` — 모순이 아니다
+
+⑤에서 `update_chain`이 인메모리 맵에서 `old`를 제거하는데, ④에서는 `old`를 트리에 다시 넣는다.
+**대상이 다르다.**
+
+| | 무엇을 담나 | ④ | ⑤ |
+|---|---|---|---|
+| `tree_state` | 곁가지 포함 **모든 후보** | `old` 재삽입 | — |
+| `canonical_in_memory_state` | **정본 체인만** (provider가 읽음) | — | `old` 제거 |
+
+**"정본에서는 빼지만 후보 목록에는 남긴다."** 리오르그는 다시 뒤집힐 수 있고, 트리에서 지웠으면
+`on_new_head`의 첫 `let Some(...) else { return Ok(None) }`에 걸려 갈아탈 수 없게 된다.
+
+### 🎓 소유권 순서가 코드 순서를 정한다
+
+⑤에서 `update_chain(chain_update)`이 **소유권을 가져간다** (`&`도 `&mut`도 아님). 그래서:
+
+- **②③을 미리 해둔다** — 이동 전에 필요한 것을 뽑아놓음
+- **④는 `&chain_update`로 본다** — `&`를 빼면 여기서 이동해 ⑤가 `E0382: use of moved value`
+- **⑥은 ②에서 떠둔 `tip`을 쓴다** — `chain_update.tip()`을 다시 부를 수 없음
+
+`if let ... = &chain_update`의 `&` 하나가 **함수 전체의 문장 순서를 결정한다.**
+
+---
+
+## 13. ★ §5 + §7 — 스펙 공백에서의 선택
+
+이번 주 대조에서 제일 깊이 판 항목.
+
+### 사실
+
+`tree/mod.rs:1353-1363` — `apply_chain_update`
+
+```rust
+if let Some(chain_update) = self.on_new_head(state.head_block_hash)? {
+    let tip = chain_update.tip().clone_sealed_header();
+    self.on_canonical_chain_update(chain_update);          // ← head를 갱신한다
+
+    // Update the safe and finalized blocks and ensure their values are valid
+    if let Err(outcome) = self.ensure_consistent_forkchoice_state(state) {
+        return Ok(Some(TreeOutcome::new(outcome)));        // ← -38002. head 갱신은 남는다
+    }
+```
+
+- **롤백 경로가 없다.** `on_canonical_chain_update`를 되돌리는 함수가 존재하지 않는다.
+- **순서는 의도적이다** — `ensure_consistent_forkchoice_state`의 주석이
+  *"…in the canonical chain **after the head block is canonicalized**"*라고 명시한다.
+  §5의 판정 기준이 *"the chain defined by `headBlockHash`"* = **새 head의 체인**이므로 먼저
+  갱신해야 `find_canonical_header`로 검사할 수 있다.
+- **`finalized`/`safe`를 갱신하는 코드는 두 줄뿐이다** (`tree/mod.rs:3228`, `:3258`). 둘 다
+  `ensure_consistent_forkchoice_state`가 부르는 함수 안이고, 그 함수는 fcU 처리 중에만 불린다.
+  → **부분 갱신 상태는 다음 fcU가 성공해야 해소된다.**
+- **`-38002`를 받아 복구하는 코드는 없다.**
+  `grep -rn "InvalidState\|invalid_state" crates/engine/ crates/rpc/rpc-engine-api/` 결과가
+  전부 생성·변환·코드 매핑이다.
+
+### 복구 경로 — 리오르그가 아니라 "다음 fcU"다
+
+```
+T0   CL: fcU(head=0xAB, finalized=0xBB)   ← 0xBB가 0xAB 체인에 없음
+       apply_chain_update
+         ├─ on_canonical_chain_update  →  head = 0xAB  ✅
+         └─ ensure_consistent_forkchoice_state → Err → -38002
+                                                 finalized = 옛 값 ❌
+     [불일치 창 열림]
+
+T1   CL이 상태를 고쳐 재전송: fcU(head=0xAB, finalized=<올바른 값>)
+       ① validate_forkchoice_state   통과
+       ② handle_canonical_head       ← head == tip이니 여기가 잡는다
+            ensure_consistent_forkchoice_state → 성공 → finalized 갱신 ✅
+     [창 닫힘]
+```
+
+T1에서 `apply_chain_update`가 아니라 `handle_canonical_head`를 탄다. **그 함수는 head를 갱신하지
+않으므로 원자성 문제가 애초에 없다** — 원자성 문제는 `apply_chain_update` 경로에만 있다.
+
+**CL이 같은 모순 상태를 반복 전송하면 창이 닫히지 않는다.** 그 동안
+`eth_getBlockByNumber("finalized")`가 정본 체인에 없는 블록을 반환할 수 있다.
+
+### ★ 스펙이 이 경우를 규정하지 않았다
+
+```bash
+grep -n "MUST NOT" paris.md
+```
+
+`forkchoiceUpdatedV1`에서 "갱신 금지"를 말하는 조항:
+
+| 조항 | 실패 원인 | 갱신 금지 문구 |
+|---|---|---|
+| **§3** | PoW terminal block 검증 실패 | ✅ *"**MUST NOT** update the forkchoice state and **MUST NOT** begin a payload build process"* |
+| **§4** | payload 검증 실패 | ✅ 같은 문장 |
+| **§5** | forkchoiceState 모순 (`-38002`) | ❌ **없음.** *"MUST return `-38002`"*만 |
+| **§6** | 너무 깊은 리오르그 (`-38006`) | ❌ **없음** |
+| §8.3 | payloadAttributes 실패 | ✅ 반대 방향 — *"MUST NOT be **rolled back**"* |
+
+**§3·§4에는 있고 §5·§6에는 없다.** 같은 문서, 같은 목록, 이웃한 조항인데 한쪽만 그 문장을 달고
+있으므로 문체 실수로 보기 어렵다.
+
+그리고 §7의 전제가 §5 상황에서 만족된다.
+
+```
+§5 →  "-38002를 반환하라"          (갱신에 대해서는 침묵)
+§7 →  "둘 다 VALID면 갱신하라 + 원자적으로"
+      ↑ 전제(head와 finalized가 VALID)가 이 상황에서 참이다
+```
+
+**두 조항이 서로를 해소하지 못하고, 우선순위가 명시돼 있지 않다.**
+→ reth의 동작은 **명시적 위반이 아니라 공백에서의 선택**이다.
+
+### 그럼에도 문제로 볼 근거 넷
+
+1. **§7의 "atomically"가 부분 갱신을 겨냥한다.** 에러로 끝난 호출이 갱신을 남기면 "이 호출로
+   인한 모든 갱신이 원자적"이라고 말할 수 없다.
+2. **§3·§4와의 일관성.** "검증이 실패하면 갱신하지 않는다"가 이 함수의 일관된 원칙인데 §5만
+   다르게 취급할 이유가 안 보인다.
+3. **관측 가능한 해악.** `finalized` 태그가 정본 밖 블록을 가리킬 수 있고 자동 복구되지 않는다.
+   그 태그는 거래소·앱이 확정 판단에 쓰는 값이다(§3 참조).
+4. **갱신을 미뤄도 손실이 없다.** 다음 fcU가 어차피 온다. 그때 `on_new_head`를 다시 계산하는
+   비용은 인메모리 부모 사슬 순회뿐이고, 리오르그 규모가 1~2블록이라 사실상 공짜다.
+   반면 미리 갱신해서 얻는 것은 없다.
+
+### 회피 가능성
+
+`on_new_head`는 `new_chain: Vec<ExecutedBlock>`을 **반환**한다. 커밋 전에 그 벡터 안에서
+finalized 해시를 찾으면 된다.
+
+```
+현재:   on_new_head → 커밋 → 검사 → 실패면 에러 (부분 갱신 남음)
+가능:   on_new_head → new_chain에서 검사 → 통과하면 커밋
+```
+
+**"물리적으로 불가피했다"는 방어가 성립하지 않는다.** 트레이드오프 판단이다.
+
+### 미확인 / 반론
+
+- **재현하지 않았다.**
+- finalized 아래 리오르그 자체가 극히 드물고, 정상 CL은 finalized보다 낮은 블록을 head로
+  지정하지 않는다. reth는 그 경우를 거부하지 않고 `reorgs.finalized` 메트릭으로 센다
+  (`tree/mod.rs:2758-2772`).
+- **"실질적으로 도달하지 않는 경로"라는 반론에 반박할 데이터가 없다.**
+
+### 기여 가치 — PR보다 이슈
+
+| | 10주차 PR (`PrunedHistoryUnavailable`) | 이번 건 |
+|---|---|---|
+| 성격 | 정보 추가 (있는 값을 안 버리게) | **동작 변경** (갱신 순서 재배치) |
+| 재현 | 못 했지만 코드만 봐도 자명 | **해악 발생이 재현에 달림** |
+| 반론 | 브레이킹 체인지 하나 | **"정상 CL은 그런 상태를 안 보낸다"** |
+
+CONTRIBUTING.md: *"Before making a large change, it is usually a good idea to first open an issue
+describing the change to solicit feedback and guidance."*
+
+→ **이슈로 여는 것이 맞다.** 10주차 후보 C(`MustUnwind`)를 "코드가 아니라 물어볼 이슈"로 분류한
+것과 같은 판단. 13주차에 초안을 쓴다.
+
+---
+
+## 14. `newPayload` 경로 — backfill 중에는 검증하지 않는다
+
+`tree/mod.rs:814-818`
+
+```rust
+let mut outcome = if self.backfill_sync_state.is_idle() {
+    self.try_insert_payload(payload)?.into_outcome()      // 정상: 검증하고 삽입
+} else {
+    TreeOutcome::new(self.try_buffer_payload(payload)?)   // 파이프라인 중: 버퍼에만
+};
+```
+
+`tree/mod.rs:894-911` `try_buffer_payload`
+
+```rust
+match self.payload_validator.convert_payload_to_block(payload) {
+    // if the block is well-formed, buffer it for later
+    Ok(block) => {
+        if let Err(error) = self.buffer_block(block) {
+            Ok(self.on_insert_block_error(error)?)
+        } else {
+            Ok(PayloadStatus::from_status(PayloadStatusEnum::Syncing))
+        }
+    }
+```
+
+`convert_payload_to_block`은 형식 변환(§1~2의 자기 완결적 검사)만 하고 **실행 검증은 안 한다.**
+
+→ validation §6(*"MUST NOT be affected by an active sync process on a side branch"*) 대조 재료.
+단 **개념이 다르다.**
+
+| | 대상 |
+|---|---|
+| 스펙 §6의 "sync process on a **side branch**" | **곁가지 하나**를 채우는 동기화 |
+| reth의 backfill | **정본 체인**을 대량으로 따라잡는 동기화 |
+
+결과적으로는 §6이 금지한 일(정본 검증 지연)이 벌어지지만, 이유는 스펙이 상정한 것과 다르다 —
+*"it requires **exclusive access to the database**"*라는 물리적 제약이다(`tree/mod.rs:1232`).
+**스펙이 이 경우를 다루지 않는다.**
+
+### ★ `ACCEPTED`는 reth가 만들지 않는다
+
+```bash
+grep -rn "Accepted" --include=*.rs crates/ | grep -v metrics.rs | grep -v test
+```
+
+나오는 곳이 셋뿐이다.
+
+| 위치 | 무엇 |
+|---|---|
+| `ethereum/node/src/engine_ssz_containers.rs` | SSZ 직렬화/역직렬화 — **외부에서 받은 값**을 숫자 3과 매핑 |
+| `engine/primitives/src/forkchoice.rs:173` | `match` 팔에서 `Valid`와 같이 취급 |
+| `tree/metrics.rs:477` | 메트릭 카운터 |
+
+**생성하는 코드가 없다.** 그리고 주석이 스펙을 설명할 뿐 구현을 설명하지 않는다.
+
+`forkchoice.rs:173-174`
+
+```rust
+PayloadStatusEnum::Valid | PayloadStatusEnum::Accepted => {
+    // `Accepted` is only returned on `newPayload`. It would be a valid state here.
+```
+
+월요일에 "status 5개 중 `ACCEPTED`가 왜 필요한가"를 그렇게 팠는데, **reth는 그 값을 쓰지 않는다.**
+
+---
+
+## 15. 스펙 대조 결과 (9줄)
+
+| # | 스펙 | 코드 | 사실 |
+|---|---|---|---|
+| 1 | fcU §6 `-38006 Too deep reorg` — "the limitation **specific to the client software**" | `grep "38006\|TooDeepReorg\|too deep"` → **0건** | ⚠️ **미구현.** 제한을 두지 않는 쪽을 골랐다 |
+| 2 | fcU §5 + §7 (갱신 금지 문구 / atomically) | `apply_chain_update`에서 head 갱신 후 검증. 롤백 없음 | ⚠️ **스펙 공백.** §11~13 참조 |
+| 3 | fcU §8.3 "MUST NOT be rolled back" | `engine_api.rs:918` + `process_payload_attributes` 문서 | ✅ **두 계층에서** 준수 |
+| 4 | validation §4 "MUST be **idempotent**" | `InvalidHeaderCache` — 재검증 자체를 안 한다 | ✅ 준수 |
+| 5 | Sync note "**implementation dependent**" | staged sync 파이프라인이 그 자리 | ✅ 스펙이 비운 자리 |
+| 6 | validation §6 side branch | backfill 중 정본 payload 검증도 미룸 (`try_buffer_payload` → SYNCING) | ⚠️ **개념이 다름.** §14 참조 |
+| 7 | fcU §2 skip 허용 범위 | 주석은 "ancestor of the **head of canonical chain**", 스펙은 "ancestor of the latest known **finalized** block" | ⚠️ **문구 불일치.** reth가 더 넓게 skip |
+| 8 | (스펙에 없음) | 초기 fcU에서 `safe`를 동기화 목표로 사용 (`tree/mod.rs:1388`) | ⚠️ **reth만의 선택** |
+| 9 | newPayload §6 `ACCEPTED` 반환 조건 | 생성하는 코드 없음 | ⚠️ **미구현** |
+
+**판정("위반/차이/준수")은 금요일에 한다.** 지금은 사실만 모은 상태다.
+
+> **`MIN_BLOCKS_FOR_PIPELINE_RUN = 32`를 1번의 한계값으로 착각하면 안 된다.** 그건 파이프라인
+> 발동 문턱이고 리오르그를 **거부**하는 값이 아니다. 깊으면 파이프라인으로 처리할 뿐 에러를
+> 내지 않는다.
+
+---
+
+## 16. 이번 주 수확
 
 1. **★ head ≠ header.** `head`는 체인의 끝을 가리키는 포인터(`BlockNumHash`), `header`는 블록
    메타데이터(`SealedHeader`). 영어가 비슷할 뿐 무관하다.
@@ -834,14 +1136,27 @@ let unwind_to = local_head.block.number
 9. **`on_forkchoice_updated`는 4단이다.** 마지막 `handle_missing_block`이 fallback이고,
    스펙 §1(MAY sync)과 §9(MUST SYNCING)를 한 번에 만족시킨다.
 10. **주석이 인용한 스펙 문구를 원문과 나란히 놓아야 한다.** §2 불일치가 그렇게 나왔다.
+11. **★ "VALID"가 두 가지를 뜻한다.** 블록의 유효성(블록 하나)과 forkchoiceState의
+    정합성(블록 사이의 관계)은 다른 층이다. `-38002`의 이름이 `Invalid forkchoice state`인 게 그
+    증거 — 나쁜 것은 블록이 아니라 세 해시의 조합이다.
+12. **★ 스펙의 침묵도 발견이다.** §3·§4에는 "MUST NOT update the forkchoice state"가 있고
+    §5·§6에는 없다. 그 비대칭을 찾은 것이 이번 주 대조에서 제일 값어치 있는 결과다.
+13. **★ "다르다"와 "위반이다"는 다르다.** 스펙이 규정하지 않은 지점에서는 "위반"이라고 쓸 수
+    없다. 대신 ①MUST 문장의 정신 ②이웃 조항과의 일관성 ③관측 가능한 해악 ④회피 가능성 ⑤미확인
+    사항을 나란히 적는다. 이게 Phase 4에서 쓸 서술 형식이다.
+14. **소유권이 문장 순서를 정한다.** `update_chain(chain_update)`이 값을 가져가므로 그 앞의 세
+    줄은 "이동 전에 필요한 것을 뽑는" 코드다. `&chain_update`의 `&` 하나가 그것을 성립시킨다.
+15. **`ACCEPTED`를 reth가 만들지 않는다.** 월요일에 그 값의 존재 이유를 가장 깊게 팠는데
+    구현에는 없었다. **스펙을 읽고 나서 코드를 보면 "없는 것"이 보인다.**
 
-## 13. 다음으로 넘길 질문
+## 17. 다음으로 넘길 질문
 
-1. `apply_chain_update` 안에서 리오르그가 실제로 적용되는 전체 경로 (수요일)
-2. fcU §7의 "atomically"를 어디서 보장하나 — 8주차 "저장소 셋을 순서로 해결"과 같은 방식인가
-3. `DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD = 16`은 왜 필요한가? 주석이 *"before engine API
+1. `DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD = 16`은 왜 필요한가? 주석이 *"before engine API
    processing is **stalled**"*라는데, 저장이 밀리면 엔진이 일부러 멈추는 이유는?
-4. `detached_head_attempts`에 상한이 있나? 계속 늘어나면 어디까지 가나
-5. `ACCEPTED`로 미뤄둔 곁가지가 정본이 되면 그 검증은 어느 함수에서 일어나나
-6. 라이브 경로에서 CL이 준 블록의 부모를 모르면? (`on_disconnected_downloaded_block`의
+2. `detached_head_attempts`에 상한이 있나? 계속 늘어나면 어디까지 가나
+3. 곁가지 블록을 `newPayload`로 받으면 `ACCEPTED` 대신 무엇을 반환하나?
+   (`try_insert_payload`를 따라가 볼 것)
+4. 라이브 경로에서 CL이 준 블록의 부모를 모르면? (`on_disconnected_downloaded_block`의
    "downloaded"가 붙은 이유)
+5. `-38002` 상황을 재현할 방법이 있나? (§13의 유일한 미확인 항목)
+6. `crates/net/` 13개 크레이트 — 이번 주에 "다운로드"로 처음 마주쳤다. Phase 3에서 볼 영역인가
