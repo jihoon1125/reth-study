@@ -1023,7 +1023,13 @@ CONTRIBUTING.md: *"Before making a large change, it is usually a good idea to fi
 describing the change to solicit feedback and guidance."*
 
 → **이슈로 여는 것이 맞다.** 10주차 후보 C(`MustUnwind`)를 "코드가 아니라 물어볼 이슈"로 분류한
-것과 같은 판단. 13주차에 초안을 쓴다.
+것과 같은 판단.
+
+> ⚠️ **목요일에 이 판정이 바뀌었다.** 같은 부분 갱신 상황이 `on_canonicalized_sync_target`에도
+> 있고, 거기 로그 메시지가 그 상태를 명명하고 있다 —
+> *"Canonicalized sync target head before safe/finalized could be applied"*.
+> **reth가 인지하고 있는 의도된 상태**로 보이므로 기여 후보로서는 약해진다.
+> 자세한 것은 [diagram.md](diagram.md) §5.
 
 ---
 
